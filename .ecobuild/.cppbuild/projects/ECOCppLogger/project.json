@@ -1,0 +1,22 @@
+{
+  "data": {
+    "dependencies": {},
+    "guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
+    "initial_type": "static_library",
+    "name": "ECOCppLogger",
+    "project_headers": [],
+    "source_directories": [
+      "src",
+      "include"
+    ],
+    "system_headers": [],
+    "types": {
+      "interface_library": "interface_library-d3274ed2264f270f0df68d13790f4e056b7e1b4883abf50e3354ea0f1af858e5.json",
+      "shared_library": "shared_library-731c48f4ec8ff2d1ee367f42a4456f40d4a912a880e116d761d3946267f49e9d.json",
+      "static_library": "static_library-113362d6a55a73fc2c1dd69d6ae032336e74b708f3a337144b46b4ab7f50e5b0.json"
+    },
+    "windows_export_all_symbols": true
+  },
+  "kind": "project",
+  "schema_version": 5
+}

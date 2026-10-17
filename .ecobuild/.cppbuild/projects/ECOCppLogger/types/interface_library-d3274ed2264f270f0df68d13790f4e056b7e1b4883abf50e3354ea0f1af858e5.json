@@ -1,0 +1,11 @@
+{
+  "data": {
+    "compile_definitions": [],
+    "include_directories": [
+      "include"
+    ],
+    "public_definitions": []
+  },
+  "kind": "interface_library",
+  "schema_version": 5
+}

@@ -1,0 +1,11 @@
+{
+  "data": {
+    "compile_definitions": [],
+    "include_directories": [
+      "include"
+    ],
+    "public_definitions": []
+  },
+  "kind": "test",
+  "schema_version": 5
+}

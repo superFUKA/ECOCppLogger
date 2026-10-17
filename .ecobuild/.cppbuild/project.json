@@ -1,0 +1,32 @@
+{
+  "data": {
+    "base_directory": "../..",
+    "dependency_directories": [
+      "../../deps"
+    ],
+    "file_templates": {
+      "app": "app.cpp",
+      "bench": "bench.cpp",
+      "header": "header.h",
+      "main": "main.cpp",
+      "pch": "pch.h",
+      "source": "source.cpp",
+      "test": "test.cpp",
+      "unit_test": "unit_test.cpp"
+    },
+    "main_project": "ECOCppLogger",
+    "name": "ECOCppLogger",
+    "projects": {
+      "ECOCppLogger": "../../ECOCppLogger",
+      "ECOCppLoggerTest": "../../ECOCppLoggerTest"
+    },
+    "references": {},
+    "solution_folders": {
+      "linked_projects": "LinkedProjects",
+      "project_folders": {},
+      "projects": "Projects"
+    }
+  },
+  "kind": "solution",
+  "schema_version": 5
+}

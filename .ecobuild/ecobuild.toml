@@ -1,0 +1,10 @@
+# ECOBuildのモジュール設定。
+format = 1
+
+[module]
+name = "ECOCppLogger"
+type = "cpp"
+
+[branches]
+# task start の --base を省略したときの作成元
+default_base = "main"

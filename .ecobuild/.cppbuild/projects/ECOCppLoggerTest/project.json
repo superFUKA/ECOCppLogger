@@ -1,0 +1,27 @@
+{
+  "data": {
+    "dependencies": {
+      "3dd2e9aa9a294dd2baea7036a26804db": {
+        "kind": "project",
+        "values": {
+          "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
+          "project_type": "static_library"
+        }
+      }
+    },
+    "guid": "6cb304bb-c2b5-45e2-afb5-9b5c975f803e",
+    "initial_type": "test",
+    "name": "ECOCppLoggerTest",
+    "project_headers": [],
+    "source_directories": [
+      "src",
+      "include"
+    ],
+    "system_headers": [],
+    "types": {
+      "test": "test-cb97757dce14a7fcd02273a6393472c0601d65cce77befd067c610bc2ec5d99b.json"
+    }
+  },
+  "kind": "project",
+  "schema_version": 5
+}

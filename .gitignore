@@ -1,0 +1,6 @@
+# 依存先のclone・ビルドの中間ファイル
+/deps/
+/build/
+
+# CppBuildの中間ファイル・成果物
+/.ecobuild/.cppbuild/output/

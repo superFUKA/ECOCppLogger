@@ -32,50 +32,50 @@ if(NOT TARGET GTest::gtest_main)
   endif()
 endif()
 
-add_executable(ECOCppLogger_ECOCppLoggerTest ${_cppbuild_sources})
-set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES OUTPUT_NAME "ECOCppLoggerTest")
+add_executable(ECOCppLoggerTest ${_cppbuild_sources})
+set_target_properties(ECOCppLoggerTest PROPERTIES OUTPUT_NAME "ECOCppLoggerTest")
 # Visual Studio debugs in the Project directory, where CppBuild's run and the tests start too.
-set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${_cppbuild_project_dir}")
-target_include_directories(ECOCppLogger_ECOCppLoggerTest PRIVATE "${_cppbuild_project_dir}/include")
-target_compile_options(ECOCppLogger_ECOCppLoggerTest PRIVATE "$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/utf-8;/Zc:__cplusplus>" "$<$<COMPILE_LANG_AND_ID:C,MSVC>:/utf-8>")
-target_link_libraries(ECOCppLogger_ECOCppLoggerTest PRIVATE GTest::gtest_main GTest::gmock ECOCppLogger::ECOCppLogger_static)
+set_target_properties(ECOCppLoggerTest PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${_cppbuild_project_dir}")
+target_include_directories(ECOCppLoggerTest PRIVATE "${_cppbuild_project_dir}/include")
+target_compile_options(ECOCppLoggerTest PRIVATE "$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/utf-8;/Zc:__cplusplus>" "$<$<COMPILE_LANG_AND_ID:C,MSVC>:/utf-8>")
+target_link_libraries(ECOCppLoggerTest PRIVATE GTest::gtest_main GTest::gmock ECOCppLogger::ECOCppLogger_static)
 if(MSVC)
-  target_compile_options(ECOCppLogger_ECOCppLoggerTest PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:/W3>")
+  target_compile_options(ECOCppLoggerTest PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:/W3>")
 endif()
-set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+set_target_properties(ECOCppLoggerTest PROPERTIES CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 if(DEFINED ECOCppLogger_ECOCppLoggerTest_CXX_STANDARD)
-  set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES CXX_STANDARD ${ECOCppLogger_ECOCppLoggerTest_CXX_STANDARD})
+  set_target_properties(ECOCppLoggerTest PROPERTIES CXX_STANDARD ${ECOCppLogger_ECOCppLoggerTest_CXX_STANDARD})
 endif()
 if(ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY)
-  set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES
+  set_target_properties(ECOCppLoggerTest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY}"
     ARCHIVE_OUTPUT_DIRECTORY "${ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY}"
     PDB_OUTPUT_DIRECTORY "${ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY}"
   )
 endif()
-set_property(GLOBAL APPEND PROPERTY CPPBUILD_COMPILED_TARGETS ECOCppLogger_ECOCppLoggerTest)
+set_property(GLOBAL APPEND PROPERTY CPPBUILD_COMPILED_TARGETS ECOCppLoggerTest)
 if(_cppbuild_modules)
   if(CMAKE_VERSION VERSION_LESS 3.28)
-    message(FATAL_ERROR "ECOCppLogger_ECOCppLoggerTest has C++ module interface units, which need CMake 3.28 or later")
+    message(FATAL_ERROR "ECOCppLoggerTest has C++ module interface units, which need CMake 3.28 or later")
   endif()
-  target_sources(ECOCppLogger_ECOCppLoggerTest PRIVATE FILE_SET cppbuild_modules TYPE CXX_MODULES
+  target_sources(ECOCppLoggerTest PRIVATE FILE_SET cppbuild_modules TYPE CXX_MODULES
     BASE_DIRS "${_cppbuild_project_dir}" FILES ${_cppbuild_modules})
-  set_property(GLOBAL APPEND PROPERTY CPPBUILD_MODULE_TARGETS ECOCppLogger_ECOCppLoggerTest)
+  set_property(GLOBAL APPEND PROPERTY CPPBUILD_MODULE_TARGETS ECOCppLoggerTest)
 endif()
 if(WIN32)
   # DLLs the program loads (imported libraries, libraries with their own output directory)
   # beside it, so it starts from Visual Studio, CppBuild's run or the tests alike.
-  add_custom_command(TARGET ECOCppLogger_ECOCppLoggerTest POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E "$<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:ECOCppLogger_ECOCppLoggerTest>>,copy_if_different,true>"
-      "$<TARGET_RUNTIME_DLLS:ECOCppLogger_ECOCppLoggerTest>" "$<TARGET_FILE_DIR:ECOCppLogger_ECOCppLoggerTest>" COMMAND_EXPAND_LISTS VERBATIM)
+  add_custom_command(TARGET ECOCppLoggerTest POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E "$<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:ECOCppLoggerTest>>,copy_if_different,true>"
+      "$<TARGET_RUNTIME_DLLS:ECOCppLoggerTest>" "$<TARGET_FILE_DIR:ECOCppLoggerTest>" COMMAND_EXPAND_LISTS VERBATIM)
 endif()
 if(DISPLAY IN_LIST CPPBUILD_REQUESTED AND NOT CPPBUILD_WHOLE_SOLUTION)
   # Listed for the IDE only: shown, but not part of the default build.
-  set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES EXCLUDE_FROM_ALL ON EXCLUDE_FROM_DEFAULT_BUILD ON)
+  set_target_properties(ECOCppLoggerTest PROPERTIES EXCLUDE_FROM_ALL ON EXCLUDE_FROM_DEFAULT_BUILD ON)
   if(CMAKE_RUNTIME_OUTPUT_DIRECTORY AND CPPBUILD_LINKED_OUTPUT AND NOT ECOCppLogger_ECOCppLoggerTest_OUTPUT_DIRECTORY)
     # Programs of different Solutions may share a file name.
-    set_target_properties(ECOCppLogger_ECOCppLoggerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CPPBUILD_LINKED_OUTPUT}")
+    set_target_properties(ECOCppLoggerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CPPBUILD_LINKED_OUTPUT}")
   endif()
 endif()
 
@@ -85,9 +85,9 @@ if(CPPBUILD_WHOLE_SOLUTION)
   if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.2)
     set(_cppbuild_discovery_args DISCOVERY_EXTRA_ARGS "--gtest_output=")
   endif()
-  gtest_discover_tests(ECOCppLogger_ECOCppLoggerTest DISCOVERY_MODE PRE_TEST WORKING_DIRECTORY "${_cppbuild_project_dir}"
+  gtest_discover_tests(ECOCppLoggerTest DISCOVERY_MODE PRE_TEST WORKING_DIRECTORY "${_cppbuild_project_dir}"
     # Without a prefix, a test name shared by two TEST Projects takes both labels.
-    TEST_PREFIX "ECOCppLoggerTest." PROPERTIES LABELS ECOCppLogger_ECOCppLoggerTest ${_cppbuild_discovery_args})
+    TEST_PREFIX "ECOCppLoggerTest." PROPERTIES LABELS ECOCppLoggerTest ${_cppbuild_discovery_args})
 endif()
 
 if(_cppbuild_sources OR _cppbuild_modules)

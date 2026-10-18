@@ -1,5 +1,5 @@
 # ECOBuildのモジュール設定。
-format = 1
+format = 2
 
 [module]
 name = "ECOCppLogger"

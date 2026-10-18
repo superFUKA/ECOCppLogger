@@ -138,7 +138,7 @@ endif()
 # Visual Studio starts the first program that exists (a TEST only with BUILD_TESTING);
 # without it, F5 would start ALL_BUILD, the first project of the .sln.
 if(CPPBUILD_WHOLE_SOLUTION)
-  foreach(_cppbuild_startup IN ITEMS ECOCppLogger_ECOCppLoggerTest)
+  foreach(_cppbuild_startup IN ITEMS ECOCppLoggerTest)
     if(TARGET ${_cppbuild_startup})
       set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${_cppbuild_startup})
       break()

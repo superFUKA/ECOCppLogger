@@ -18,6 +18,14 @@
 
 #include "ECOCppLogger/ECOCppLogger.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <intrin.h>
+#endif
+#include <cstdlib>
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -283,9 +291,56 @@ void writeModes() {
     eco::log::start(benchConfig());
 }
 
+// ---- ファイバー対策：自分のスレッドのバッファーを毎回読み直す方法の比べ ---------------------------------------
+// ファイバーが中断の前後で別のスレッドへ移ると、コンパイラが thread_local の番地を使い回して古いスレッドの値を読む
+// おそれがある。毎回読み直す方法を3つ比べる。
+thread_local void* t_inlineSlot = &g_sink;
+
+__declspec(noinline) void* readNoInline() {
+    return t_inlineSlot;
+}
+
+#if defined(_WIN32) && defined(_M_X64)
+DWORD g_tlsIndex = TLS_OUT_OF_INDEXES;
+// TEB の TlsSlots（gs:[0x1480 + index*8]、index < 64）を直接1回読む。__readgsqword はコンパイラが使い回さない。
+inline void* readTlsSlot() {
+    return reinterpret_cast<void*>(__readgsqword(0x1480 + g_tlsIndex * 8));
+}
+#endif
+
+void fiberSafeThreadLocal() {
+    std::printf("\n[7] ファイバー対策：スレッドごとの値を毎回読み直す方法（1億回の平均）\n");
+    constexpr int kCount = 100'000'000;
+    const auto run = [&](const char* name, auto&& read) {
+        std::uintptr_t sum = 0;
+        const auto start = Clock::now();
+        for (int i = 0; i < kCount; ++i) {
+            sum += reinterpret_cast<std::uintptr_t>(read()) + static_cast<std::uintptr_t>(i);
+            // 毎回「外の関数を呼んだ」ことにして、コンパイラに読み直しを強いる（ログの間にほかの処理がある状況）
+            g_sink.fetch_add(sum & 1, std::memory_order_relaxed);
+        }
+        const double ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count() / kCount;
+        std::printf("  %-52s %.2f ns\n", name, ns);
+    };
+    run("thread_local をインラインで読む（今。ファイバーに安全でない）", [] { return t_inlineSlot; });
+    run("thread_local を非インライン関数で読む", [] { return readNoInline(); });
+#if defined(_WIN32) && defined(_M_X64)
+    g_tlsIndex = TlsAlloc();
+    if (g_tlsIndex < 64) {
+        TlsSetValue(g_tlsIndex, &g_sink);
+        run("TLS スロットを gs から直接読む（インライン・安全）", [] { return readTlsSlot(); });
+        run("TlsGetValue（OS の関数）", [] { return TlsGetValue(g_tlsIndex); });
+    }
+#endif
+}
+
 }  // namespace
 
 int main() {
+    if (std::getenv("ECO_BENCH_TLS_ONLY")) {
+        fiberSafeThreadLocal();
+        return 0;
+    }
     std::error_code error;
     std::filesystem::remove_all(benchDirectory(), error);
     eco::log::start(benchConfig());

@@ -137,6 +137,12 @@ private:
     };
 
     void run();
+    bool pass(bool stats, bool stopping);
+
+public:
+    void writeNow();
+
+private:
     void drain(bool emergency);
     void emitStats(bool emergency);
     void writeHistories(std::string_view reason, std::uint64_t untilTick, const std::vector<HistoryCapture>& captures);
@@ -345,13 +351,19 @@ bool Backend::start(const Config& config) {
         detail::installCrashHandler();
     }
     running.store(true);
-    thread_ = std::thread([this] { run(); });
+    if (config_.writeMode != WriteMode::Manual) {
+        thread_ = std::thread([this] { run(); });
+    }
     return true;
 }
 
 void Backend::stop() {
     std::lock_guard control(controlMutex);
     if (!running.exchange(false)) {
+        return;
+    }
+    if (config_.writeMode == WriteMode::Manual) {
+        pass(false, true);  // 残りを呼んだスレッドで書いて閉じる
         return;
     }
     wake();
@@ -372,12 +384,51 @@ void Backend::flush(bool stats) {
     if (!running.load()) {
         return;
     }
+    if (config_.writeMode == WriteMode::Manual) {
+        pass(stats, false);
+        return;
+    }
     std::unique_lock lock(wakeMutex_);
     const std::uint64_t ticket = ++flushRequested_;
     wakeRequested_ = true;
     statsRequested_ = statsRequested_ || stats;
     wakeCondition_.notify_one();
     flushedCondition_.wait(lock, [&] { return flushDone_ >= ticket || !running.load(); });
+}
+
+// 1回の書き出し：全スレッドのバッファを書き写し、頼まれた最近の値・集計（間隔が来たら）を書き、ディスクへ出す。
+// 裏のスレッド（Interval・OnRequest）か、writeOut() を呼んだスレッド（Manual）で動く。落ちた後なら何もしない。
+bool Backend::pass(bool stats, bool stopping) {
+    std::vector<DumpRequest> dumps;
+    {
+        std::lock_guard lock(dumpMutex_);
+        dumps.swap(dumps_);
+    }
+    std::lock_guard lock(io_);
+    if (crashed_.load() || !file_) {
+        return false;
+    }
+    drain(false);
+    for (const DumpRequest& dump : dumps) {
+        writeHistories(dump.reason, dump.tick, dump.captures);
+    }
+    const double elapsedMs = clock_->toNanoseconds(static_cast<double>(ticks() - lastStatTick_)) / 1.0e6;
+    if (stats || stopping || elapsedMs >= config_.statIntervalMs) {
+        emitStats(false);
+    }
+    if (stopping) {
+        drain(false);
+        writeSessionEnd(false);
+    }
+    writeOut();
+    if (file_) {
+        std::fflush(file_);
+    }
+    if (stopping && file_) {
+        std::fclose(file_);
+        file_ = nullptr;
+    }
+    return true;
 }
 
 void Backend::run() {
@@ -388,52 +439,44 @@ void Backend::run() {
         bool stopping;
         {
             std::unique_lock lock(wakeMutex_);
-            wakeCondition_.wait_for(lock, poll, [&] { return wakeRequested_ || !running.load(); });
+            const auto woken = [&] { return wakeRequested_ || !running.load(); };
+            if (config_.writeMode == WriteMode::OnRequest) {
+                wakeCondition_.wait(lock, woken);  // 頼まれるまで何もしない
+            } else {
+                wakeCondition_.wait_for(lock, poll, woken);
+            }
             wakeRequested_ = false;
             ticket = flushRequested_;
             stats = statsRequested_;
             statsRequested_ = false;
             stopping = !running.load();
         }
-        std::vector<DumpRequest> dumps;
-        {
-            std::lock_guard lock(dumpMutex_);
-            dumps.swap(dumps_);
-        }
-        {
-            std::lock_guard lock(io_);
-            if (crashed_.load()) {
-                return;
-            }
-            drain(false);
-            for (const DumpRequest& dump : dumps) {
-                writeHistories(dump.reason, dump.tick, dump.captures);
-            }
-            const double elapsedMs = clock_->toNanoseconds(static_cast<double>(ticks() - lastStatTick_)) / 1.0e6;
-            if (stats || stopping || elapsedMs >= config_.statIntervalMs) {
-                emitStats(false);
-            }
-            if (stopping) {
-                drain(false);
-                writeSessionEnd(false);
-            }
-            writeOut();
-            if (file_) {
-                std::fflush(file_);
-            }
-            if (stopping && file_) {
-                std::fclose(file_);
-                file_ = nullptr;
-            }
-        }
+        const bool alive = pass(stats, stopping);
         {
             std::lock_guard lock(wakeMutex_);
             flushDone_ = ticket;
         }
         flushedCondition_.notify_all();
-        if (stopping) {
+        if (stopping || !alive) {
             return;
         }
+    }
+}
+
+void Backend::writeNow() {
+    if (!running.load()) {
+        return;
+    }
+    if (config_.writeMode == WriteMode::Manual) {
+        bool stats;
+        {
+            std::lock_guard lock(wakeMutex_);
+            stats = statsRequested_;
+            statsRequested_ = false;
+        }
+        pass(stats, false);
+    } else {
+        wake();  // 裏のスレッドに頼むだけ（待たない）
     }
 }
 
@@ -741,6 +784,10 @@ void flush() {
 
 void flushStats() {
     backend().flush(true);
+}
+
+void writeOut() {
+    backend().writeNow();
 }
 
 bool isRunning() noexcept {

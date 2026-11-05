@@ -24,6 +24,14 @@
 
 namespace eco::log {
 
+// ファイルへ書き出すタイミング。どれでも、ログを書く側は自分のバッファにコピーするだけで、待たない。
+enum class WriteMode {
+    Interval,   // 裏のスレッドが pollIntervalMs ごとに書き出す（既定）
+    OnRequest,  // 裏のスレッドが、writeOut() を呼ばれたときだけ書き出す（例：ゲームループの終わり。重さ Error 以上のログは
+                // 頼まれなくても書き出す）。書き出しの作業は別のコアで行う
+    Manual,     // 裏のスレッドを作らない。writeOut() を呼んだスレッドがその場で書き出す（呼んだスレッドの時間を使う）
+};
+
 struct Config {
     // 書き出す先。ファイル名は <stem>_<YYYYMMDD-HHMMSS>_<pid>.ecolog（stem が空なら実行ファイルの名前）。
     // 中身は2進（動いている間は文字列にしない）。見るときは ECOCppLoggerView か eco::log::readLog で文章・JSON にする。
@@ -40,7 +48,10 @@ struct Config {
     bool recordFrame = true;
 
     std::size_t threadBufferBytes = std::size_t{1} << 20;  // スレッドごとのリングバッファ（2のべき乗に切り上げ）
-    std::uint32_t pollIntervalMs = 2;                      // 裏のスレッドが記録を見に行く間隔
+    // 書き出すタイミング。OnRequest・Manual では、writeOut() の間にたまるログがバッファ（threadBufferBytes）に
+    // 収まるようにする（溢れた分は捨てて数える）。集計は writeOut() のときに間隔（statIntervalMs）が来ていれば出す。
+    WriteMode writeMode = WriteMode::Interval;
+    std::uint32_t pollIntervalMs = 2;                      // Interval で、裏のスレッドが記録を見に行く間隔
     std::uint32_t statIntervalMs = 1000;                   // 集計を書き出す間隔
 
     std::uint64_t maxFileBytes = std::uint64_t{256} << 20;  // 超えたら次のファイル（_part2 …）へ
@@ -61,6 +72,12 @@ void flush();
 
 // 集計を今すぐ書き出す（間隔を待たずに）。flush() も行う。
 void flushStats();
+
+// 書き出しを頼む（WriteMode::OnRequest・Manual 向け。ゲームならループの終わりに1回）。
+//   OnRequest：裏のスレッドを起こすだけで、すぐ戻る（書き終わるのを待つなら flush()）
+//   Manual   ：呼んだスレッドで、その場で書き出す
+//   Interval ：裏のスレッドを今すぐ起こす（待たない）
+void writeOut();
 
 bool isRunning() noexcept;
 std::filesystem::path currentFile();

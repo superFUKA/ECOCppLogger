@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -95,6 +96,67 @@ TEST(Logger, RotatesFilesAndKeepsTheNewest) {
     }
 }
 
+namespace {
+
+// 待っても書かれないことを確かめるため、少し待ってから数える。
+std::size_t countAfter(std::chrono::milliseconds wait, std::string_view text) {
+    std::this_thread::sleep_for(wait);
+    return countContaining(readLines(eco::log::currentFile()), text);
+}
+
+// 書かれるまで（最大 2 秒）待って数える。
+std::size_t countWhenWritten(std::string_view text, std::size_t expected) {
+    std::size_t count = 0;
+    for (int i = 0; i < 200 && count < expected; ++i) {
+        count = countContaining(readLines(eco::log::currentFile()), text);
+        if (count < expected) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return count;
+}
+
+}  // namespace
+
+TEST(Logger, OnRequestWritesOnlyWhenAsked) {
+    auto config = testConfig();
+    config.writeMode = eco::log::WriteMode::OnRequest;
+    Session session(config);
+    for (int i = 0; i < 100; ++i) {
+        ECO_LOG_INFO("frame log {}", i);
+    }
+    EXPECT_EQ(countAfter(std::chrono::milliseconds(50), "\"msg\":\"frame log "), 0u);  // 頼むまでは書かない
+    eco::log::writeOut();  // ゲームループの終わり：頼むだけで、すぐ戻る
+    EXPECT_EQ(countWhenWritten("\"msg\":\"frame log ", 100), 100u);
+}
+
+TEST(Logger, OnRequestStillWritesErrorsRightAway) {
+    auto config = testConfig();
+    config.writeMode = eco::log::WriteMode::OnRequest;
+    Session session(config);
+    ECO_LOG_ERROR("something broke");
+    EXPECT_EQ(countWhenWritten("\"msg\":\"something broke\"", 1), 1u);
+}
+
+TEST(Logger, ManualWritesOnTheCallingThread) {
+    auto config = testConfig();
+    config.writeMode = eco::log::WriteMode::Manual;
+    std::filesystem::path file;
+    {
+        Session session(config);
+        file = eco::log::currentFile();
+        for (int i = 0; i < 100; ++i) {
+            ECO_LOG_INFO("manual {}", i);
+        }
+        ECO_LOG_ERROR("manual error");
+        EXPECT_EQ(countAfter(std::chrono::milliseconds(50), "\"msg\":\"manual"), 0u);  // 裏のスレッドはない
+        eco::log::writeOut();  // その場で書く
+        EXPECT_EQ(countContaining(readLines(file), "\"msg\":\"manual "), 101u);  // 100 件＋manual error
+        ECO_LOG_INFO("after write");
+    }  // stop() も呼んだスレッドで残りを書く
+    const auto lines = readLines(file);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"after write\""), 1u);
+    EXPECT_EQ(countContaining(lines, "\"event\":\"session.end\""), 1u);
+}
+
 TEST(Logger, StartTwiceFails) {
     Session session;
     EXPECT_TRUE(eco::log::isRunning());
@@ -161,6 +223,23 @@ TEST(LoggerDeathTest, AbortWritesPendingRecordsAndStack) {
     EXPECT_NE(crash->find("\"stack\":["), std::string::npos) << *crash;
     EXPECT_NE(crash->find("abortAfterLogging"), std::string::npos) << *crash;
     EXPECT_EQ(countContaining(lines, "\"event\":\"session.end\",\"crashed\":true"), 1u);
+}
+
+TEST(LoggerDeathTest, ManualModeStillWritesOnCrash) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto config = crashConfig();
+    config.writeMode = eco::log::WriteMode::Manual;  // 裏のスレッドなし・writeOut() も呼ばずに落ちる
+    std::error_code error;
+    std::filesystem::remove_all(config.directory, error);
+    EXPECT_DEATH(
+        {
+            eco::log::start(config);
+            abortAfterLogging();
+        },
+        "");
+    const auto lines = crashLog(config);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"before abort 7\""), 1u);
+    EXPECT_EQ(countContaining(lines, "\"event\":\"crash\""), 1u);
 }
 
 TEST(LoggerDeathTest, UncaughtExceptionWritesWhat) {

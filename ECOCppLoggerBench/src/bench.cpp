@@ -231,6 +231,48 @@ void backendThroughput() {
     std::printf("  書き込み %.0f ms、ファイルまで %.0f ms（%.2f M行/秒）\n", produceMs, totalMs, kCount / totalMs / 1000.0);
 }
 
+// ゲームループの終わりに書き出す：1フレームに 1000 件のログ＋5万件のまとめ書き、終わりに writeOut()。
+void writeModes() {
+    std::printf("\n[6] 書き出しのタイミング（1フレーム：ログ1000件＋まとめ書き5万件、終わりに writeOut。300フレームの平均）\n");
+    constexpr int kFrames = 300;
+    for (auto mode : {eco::log::WriteMode::Interval, eco::log::WriteMode::OnRequest, eco::log::WriteMode::Manual}) {
+        eco::log::stop();
+        auto config = benchConfig();
+        config.writeMode = mode;
+        eco::log::start(config);
+        double total = 0.0;
+        double worst = 0.0;
+        double writeTotal = 0.0;
+        for (int frame = 0; frame < kFrames; ++frame) {
+            const auto start = Clock::now();
+            ECO_FRAME();
+            for (int i = 0; i < 1000; ++i) {
+                ECO_LOG_INFO("entity {} hp={}", i, i % 100);
+            }
+            {
+                ECO_LOG_BATCH(batch, Level::Debug, "candidate {} value {}", int, int);
+                for (int i = 0; i < 50000; ++i) {
+                    batch.add(i, i & 1023);
+                }
+            }
+            const auto beforeWrite = Clock::now();
+            eco::log::writeOut();
+            const auto end = Clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+            total += ms;
+            worst = std::max(worst, ms);
+            writeTotal += std::chrono::duration<double, std::milli>(end - beforeWrite).count();
+        }
+        const char* name = mode == eco::log::WriteMode::Interval    ? "Interval（2msごとに裏で）"
+                           : mode == eco::log::WriteMode::OnRequest ? "OnRequest（頼んだときに裏で）"
+                                                                     : "Manual（呼んだスレッドで）";
+        std::printf("  %-34s 1フレーム %.3f ms（最大 %.3f ms）、うち writeOut() %.3f ms\n", name, total / kFrames, worst,
+                    writeTotal / kFrames);
+    }
+    eco::log::stop();
+    eco::log::start(benchConfig());
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +298,7 @@ int main() {
     multiThread();
     frameScenario();
     backendThroughput();
+    writeModes();
     const auto file = eco::log::currentFile();
     eco::log::stop();
     std::printf("\nログ：%s（%.1f MB）\n", file.string().c_str(),

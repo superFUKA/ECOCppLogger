@@ -16,6 +16,63 @@
 
 namespace eco::log {
 
+// 最近の値（ECO_HISTORY）。書くのは持ち主のスレッドだけで、ファイルには書かずにメモリーに置いておく。
+// 裏のスレッド・落ちたときの書き出しは、書いている途中の1件を見分けるため seqlock の形で読む。
+struct HistoryEntry {
+    std::atomic<std::uint64_t> sequence{0};  // 0 は書いている途中、それ以外は 何件目か＋1
+    std::atomic<double> value{0.0};
+    std::atomic<std::uint64_t> tick{0};
+    std::atomic<std::uint64_t> frame{0};
+};
+
+class HistoryRing {
+public:
+    explicit HistoryRing(std::size_t capacity);
+    ~HistoryRing();
+    HistoryRing(const HistoryRing&) = delete;
+    HistoryRing& operator=(const HistoryRing&) = delete;
+
+    void push(double value, std::uint64_t tick, std::uint64_t frame) noexcept {
+        const std::uint64_t n = written_.load(std::memory_order_relaxed);
+        HistoryEntry& entry = entries_[n & mask_];
+        entry.sequence.store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        entry.value.store(value, std::memory_order_relaxed);
+        entry.tick.store(tick, std::memory_order_relaxed);
+        entry.frame.store(frame, std::memory_order_relaxed);
+        entry.sequence.store(n + 1, std::memory_order_release);
+        written_.store(n + 1, std::memory_order_release);
+    }
+
+    struct Point {
+        double value;
+        std::uint64_t tick;
+        std::uint64_t frame;
+    };
+
+    // 古い順に、読めた値を callback(Point) に渡す（書いている途中・上書きされたものは飛ばす）。
+    template <class Callback>
+    void read(Callback&& callback) const {
+        const std::uint64_t written = written_.load(std::memory_order_acquire);
+        const std::uint64_t capacity = mask_ + 1;
+        for (std::uint64_t n = written > capacity ? written - capacity : 0; n < written; ++n) {
+            const HistoryEntry& entry = entries_[n & mask_];
+            const std::uint64_t before = entry.sequence.load(std::memory_order_acquire);
+            Point point{entry.value.load(std::memory_order_relaxed), entry.tick.load(std::memory_order_relaxed),
+                        entry.frame.load(std::memory_order_relaxed)};
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (before == n + 1 && entry.sequence.load(std::memory_order_relaxed) == before) {
+                callback(point);
+            }
+        }
+    }
+
+private:
+    std::atomic<std::uint64_t> written_{0};
+    std::uint64_t mask_;
+    HistoryEntry* entries_;
+};
+
 // 集計の1件。書くのは持ち主のスレッドだけ（読み・書きを分けた relaxed の load/store ＝ x64 ではただの mov）。
 // 裏のスレッドは読むだけで、回数・合計は前に出した値との差を、最小・最大は期間（epoch）ごとに出す。
 struct StatSlot {
@@ -30,6 +87,14 @@ struct StatSlot {
     // 裏のスレッドだけが使う（前に出したときの値）。
     std::uint64_t reportedCount = 0;
     double reportedSum = 0.0;
+
+    // ECO_HISTORY のときだけ、持ち主のスレッドが最初に使うときに作る。
+    std::atomic<HistoryRing*> history{nullptr};
+
+    StatSlot() = default;
+    StatSlot(const StatSlot&) = delete;
+    StatSlot& operator=(const StatSlot&) = delete;
+    ~StatSlot() { delete history.load(std::memory_order_relaxed); }
 
     void add(double value, std::uint64_t currentEpoch) noexcept {
         const std::uint64_t n = count.load(std::memory_order_relaxed);

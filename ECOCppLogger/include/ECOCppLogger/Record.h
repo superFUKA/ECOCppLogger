@@ -49,13 +49,15 @@ enum class Sampling : std::uint8_t {
     EveryN,   // N回に1回（aux＝何回目か）
     FirstN,   // 最初のN回（aux＝何回目か）
     EveryMs,  // 一定時間に1回（aux＝前の記録の後に省いた回数）
+    OnChange, // 値が変わったときだけ（aux＝何回目の変化か。0 は最初の値）
 };
 
-// 集計（ECO_STAT・ECO_COUNT・ECO_SCOPE_TIME）の呼び出し位置。index は最初に使われたときに振る。
+// 集計（ECO_STAT・ECO_COUNT・ECO_SCOPE_TIME・ECO_HISTORY）の呼び出し位置。index は最初に使われたときに振る。
 enum class StatKind : std::uint8_t {
     Value,     // 値の 回数・合計・最小・最大・最後
     Count,     // 回数だけ
     Duration,  // 区間の時間（ticks で集め、出すときにマイクロ秒にする）
+    History,   // Value に加えて、最近の値を historyCapacity 個まで覚えておく（落ちたとき・dumpHistory で書き出す）
 };
 
 struct StatSite {
@@ -63,10 +65,12 @@ struct StatSite {
     const char* file;
     std::uint32_t line;
     StatKind kind;
+    std::uint32_t historyCapacity;
     std::atomic<std::uint32_t> index{0};
 
-    constexpr StatSite(const char* name_, const char* file_, std::uint32_t line_, StatKind kind_) noexcept
-        : name(name_), file(file_), line(line_), kind(kind_) {}
+    constexpr StatSite(const char* name_, const char* file_, std::uint32_t line_, StatKind kind_,
+                       std::uint32_t historyCapacity_ = 0) noexcept
+        : name(name_), file(file_), line(line_), kind(kind_), historyCapacity(historyCapacity_) {}
 };
 
 enum class RecordKind : std::uint32_t {

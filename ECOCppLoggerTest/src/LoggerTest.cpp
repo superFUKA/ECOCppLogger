@@ -122,6 +122,9 @@ std::vector<std::string> crashLog(const eco::log::Config& config) {
 [[noreturn]] void abortAfterLogging() {
     ECO_LOG_INFO("before abort {}", 7);
     ECO_STAT("crash.stat", 3);
+    for (int i = 1; i <= 20; ++i) {
+        ECO_HISTORY_N("crash.history", 4, i * 10);
+    }
     std::abort();
 }
 
@@ -146,6 +149,13 @@ TEST(LoggerDeathTest, AbortWritesPendingRecordsAndStack) {
     const auto lines = crashLog(config);
     EXPECT_EQ(countContaining(lines, "\"msg\":\"before abort 7\""), 1u);
     EXPECT_EQ(countContaining(lines, "\"stat\":\"crash.stat\""), 1u);
+    // 落ちたときは、覚えていた最近の値（最後の 4 個）も書き出す
+    const std::string* history = findContaining(lines, "\"history\":\"crash.history\"");
+    ASSERT_NE(history, nullptr);
+    EXPECT_NE(history->find("\"reason\":\"crash\""), std::string::npos) << *history;
+    EXPECT_NE(history->find(",170],["), std::string::npos) << *history;
+    EXPECT_NE(history->find(",200]]"), std::string::npos) << *history;
+    EXPECT_EQ(history->find(",160]"), std::string::npos) << *history;
     const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
     ASSERT_NE(crash, nullptr);
     EXPECT_NE(crash->find("\"stack\":["), std::string::npos) << *crash;

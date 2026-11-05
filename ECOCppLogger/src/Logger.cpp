@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -40,7 +41,9 @@ constexpr std::string_view kAbout =
     "fn=function, msg=message. sample=this site is sampled (n=call count, skipped=calls not logged since the "
     "previous line). lv=stat lines aggregate ECO_STAT/ECO_COUNT/ECO_SCOPE_TIME over period_ms: n=calls in "
     "the period, total=calls since start, unit=us means durations in microseconds. event=dropped means the "
-    "thread's buffer was full and that many records were lost.";
+    "thread's buffer was full and that many records were lost. sample=on change lines are written only when the "
+    "value changed (change=0 is the first value). lv=history lines list the most recent values of ECO_HISTORY "
+    "kept in memory, written on crash or dumpHistory(reason); points are [f, ms before t, value], oldest first.";
 
 std::int64_t processId() {
 #if defined(_WIN32)
@@ -77,6 +80,15 @@ struct StatTotal {
     std::uint32_t threads = 0;
 };
 
+// dumpHistory・落ちたときに写した、1つの呼び出し位置・スレッドの最近の値。
+struct HistoryCapture {
+    const StatSite* site;
+    std::string thread;
+    std::vector<HistoryRing::Point> points;
+};
+
+std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emergency);
+
 // 1回の取り出しで集めた行（スレッドをまたいで時刻の順に並べ直すため）。
 struct PendingLine {
     std::uint64_t tick;
@@ -104,6 +116,19 @@ private:
     bool openFile();
     void writeSessionStart();
     void writeSessionEnd(bool crashed);
+    void writeHistories(std::string_view reason, std::uint64_t untilTick, const std::vector<HistoryCapture>& captures);
+
+public:
+    void requestDump(std::string_view reason);
+
+private:
+    struct DumpRequest {
+        std::string reason;
+        std::uint64_t tick;
+        std::vector<HistoryCapture> captures;
+    };
+    std::mutex dumpMutex_;
+    std::vector<DumpRequest> dumps_;
 
     Config config_;
     std::unique_ptr<Clock> clock_;
@@ -264,12 +289,20 @@ void Backend::run() {
             statsRequested_ = false;
             stopping = !running.load();
         }
+        std::vector<DumpRequest> dumps;
+        {
+            std::lock_guard lock(dumpMutex_);
+            dumps.swap(dumps_);
+        }
         {
             std::lock_guard lock(io_);
             if (crashed_.load()) {
                 return;
             }
             drain(false);
+            for (const DumpRequest& dump : dumps) {
+                writeHistories(dump.reason, dump.tick, dump.captures);
+            }
             const double elapsedMs = clock_->toNanoseconds(static_cast<double>(ticks() - lastStatTick_)) / 1.0e6;
             if (stats || stopping || elapsedMs >= config_.statIntervalMs) {
                 emitStats(false);
@@ -498,6 +531,79 @@ void Backend::writeSessionEnd(bool crashed) {
     out_.append("}\n");
 }
 
+// 呼んだスレッドの上で、全スレッドの最近の値を写す（裏のスレッドが読むまで待つと、その間に上書きされるため）。
+std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emergency) {
+    std::vector<HistoryCapture> captures;
+    for (auto& entry : Registry::instance().snapshot(emergency)) {
+        entry.buffer->forEachStat([&](StatSlot& slot) {
+            const HistoryRing* ring = slot.history.load(std::memory_order_acquire);
+            if (!ring) {
+                return;
+            }
+            HistoryCapture capture{slot.site.load(std::memory_order_acquire), entry.name, {}};
+            ring->read([&](const HistoryRing::Point& point) {
+                if (point.tick <= untilTick) {  // 頼まれた後の値は含めない
+                    capture.points.push_back(point);
+                }
+            });
+            if (!capture.points.empty()) {
+                captures.push_back(std::move(capture));
+            }
+        });
+    }
+    return captures;
+}
+
+void Backend::requestDump(std::string_view reason) {
+    if (!running.load()) {
+        return;
+    }
+    const std::uint64_t tick = ticks();
+    auto captures = captureHistories(tick, false);
+    {
+        std::lock_guard lock(dumpMutex_);
+        dumps_.push_back({std::string(reason), tick, std::move(captures)});
+    }
+    wake();
+}
+
+void Backend::writeHistories(std::string_view reason, std::uint64_t untilTick,
+                             const std::vector<HistoryCapture>& captures) {
+    const double ticksPerMs = clock_->ticksPerNanosecond() * 1.0e6;
+    for (const HistoryCapture& capture : captures) {
+        const StatSite* site = capture.site;
+        formatter_->appendLineStart(out_, untilTick);
+        out_.append(",\"lv\":\"history\",\"history\":");
+        detail::appendJsonString(out_, site->name);
+        std::string source(detail::sourceFileName(site->file, config_.fullPath));
+        source.push_back(':');
+        detail::appendUnsigned(source, site->line);
+        out_.append(",\"src\":");
+        detail::appendJsonString(out_, source);
+        out_.append(",\"th\":");
+        detail::appendJsonString(out_, capture.thread);
+        out_.append(",\"reason\":");
+        detail::appendJsonString(out_, reason);
+        out_.append(",\"points\":[");
+        bool first = true;
+        for (const HistoryRing::Point& point : capture.points) {
+            if (!first) {
+                out_.push_back(',');
+            }
+            first = false;
+            out_.push_back('[');
+            detail::appendUnsigned(out_, point.frame);
+            out_.push_back(',');
+            const double before = static_cast<double>(untilTick - point.tick) / ticksPerMs;
+            detail::appendDouble(out_, std::round(before * 1000.0) / 1000.0);
+            out_.push_back(',');
+            detail::appendDouble(out_, point.value);
+            out_.push_back(']');
+        }
+        out_.append("]}\n");
+    }
+}
+
 void Backend::emergency(std::string_view reason, const std::string& extraJson) noexcept {
     if (crashed_.exchange(true) || !file_) {
         return;
@@ -518,6 +624,8 @@ void Backend::emergency(std::string_view reason, const std::string& extraJson) n
         std::fflush(file_);
         drain(true);
         emitStats(true);
+        const std::uint64_t crashTick = ticks();
+        writeHistories("crash", crashTick, captureHistories(crashTick, true));
         writeSessionEnd(true);
         writeOut();
         if (file_) {
@@ -578,6 +686,10 @@ void setLevel(Level level) noexcept {
 
 Level level() noexcept {
     return static_cast<Level>(detail::g_level.load(std::memory_order_relaxed));
+}
+
+void dumpHistory(std::string_view reason) {
+    backend().requestDump(reason);
 }
 
 void setThreadName(std::string_view name) {

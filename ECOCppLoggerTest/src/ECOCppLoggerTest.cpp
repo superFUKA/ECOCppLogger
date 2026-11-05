@@ -132,6 +132,53 @@ TEST(ECOCppLogger, EveryMsLimitsRateAndCountsSkipped) {
     EXPECT_EQ(countContaining(lines, "\"skipped\":0}"), 1u);  // 最初の1回だけ省いた数が 0
 }
 
+TEST(ECOCppLogger, OnChangeLogsOnlyWhenTheValueChanges) {
+    Session session;
+    const auto watch = [](Color color) { ECO_LOG_ON_CHANGE(Level::Info, "test.color", color); };
+    for (Color color : {Color::Red, Color::Red, Color::Green, Color::Green, Color::Green, Color::Red}) {
+        watch(color);
+    }
+    const auto watchHp = [](int hp) { ECO_LOG_ON_CHANGE(Level::Info, "test.hp", hp); };
+    for (int i = 0; i < 10000; ++i) {
+        watchHp(100 - i / 5000 * 30);  // 100 が 5000 回、70 が 5000 回
+    }
+    const auto lines = session.lines();
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.color"), 3u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.color = 0\",\"sample\":\"on change\",\"change\":0"), 1u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.color: 0 -> 1\",\"sample\":\"on change\",\"change\":1"), 1u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.color: 1 -> 0\",\"sample\":\"on change\",\"change\":2"), 1u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.hp"), 2u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"test.hp: 100 -> 70\""), 1u);
+}
+
+TEST(ECOCppLogger, HistoryKeepsRecentValuesUntilDumped) {
+    Session session;
+    const auto record = [](int value) { ECO_HISTORY_N("test.history", 8, value); };
+    for (int i = 1; i <= 1000; ++i) {
+        ECO_FRAME();
+        record(i);
+    }
+    // 頼むまではファイルに書かない
+    EXPECT_EQ(countContaining(session.lines(), "\"lv\":\"history\""), 0u);
+    eco::log::dumpHistory("hp went negative");
+    for (int i = 1001; i <= 1010; ++i) {
+        record(i);  // 頼んだ後の値は含めない
+    }
+    const auto lines = session.lines();
+    const std::string* line = findContaining(lines, "\"history\":\"test.history\"");
+    ASSERT_NE(line, nullptr);
+    EXPECT_NE(line->find("\"reason\":\"hp went negative\""), std::string::npos) << *line;
+    const auto position = line->find("\"points\":[");
+    ASSERT_NE(position, std::string::npos);
+    // 最後の 8 個（993〜1000）が古い順に、[フレーム, 何ms前, 値] で並ぶ
+    std::vector<int> values;
+    for (auto at = line->find('[', position + 10); at != std::string::npos; at = line->find('[', at + 1)) {
+        const auto last = line->rfind(',', line->find(']', at));
+        values.push_back(std::stoi(line->substr(last + 1)));
+    }
+    EXPECT_EQ(values, (std::vector<int>{993, 994, 995, 996, 997, 998, 999, 1000})) << *line;
+}
+
 TEST(ECOCppLogger, AggregatesStats) {
     Session session;
     for (int i = 1; i <= 100; ++i) {

@@ -7,6 +7,8 @@
 //   ECO_LOG_EVERY_N(eco::log::Level::Debug, 1000, "step {}", i);   // 1000回に1回だけ
 //   ECO_STAT("collision.candidates", n);                 // 毎回は書かず、回数・合計・最小・最大を集計して定期的に出す
 //   ECO_SCOPE_TIME("physics.step");                      // 区間の時間を集計
+//   ECO_LOG_ON_CHANGE(eco::log::Level::Info, "player.state", state);   // 値が変わったときだけ
+//   ECO_HISTORY("player.hp", hp);                        // 最近の値を覚え、落ちたとき・dumpHistory() で書き出す
 //   eco::log::stop();
 //
 // 書式の {} は引数と同じ数にする（違えばコンパイルエラー）。書式は文字列リテラル。
@@ -127,6 +129,36 @@
         }                                                                                               \
     } while (false)
 
+// 値が変わったときだけ（最初の1回も書く）。name は文字列リテラル、value は 数値・bool・enum・ポインター。
+//   ECO_LOG_ON_CHANGE(Level::Info, "player.state", state);  →  "player.state = 0"、"player.state: 0 -> 2" …
+// 前の値は呼び出し位置・スレッドごとに覚える（同じ行を別の物に使い回すと、物が替わるたびに書く）。
+#define ECO_LOG_ON_CHANGE(lvl_, name_, value_)                                                                   \
+    do {                                                                                                         \
+        if constexpr (static_cast<int>(lvl_) >= ECO_LOG_COMPILE_LEVEL) {                                         \
+            if (::eco::log::detail::isEnabled(lvl_)) {                                                           \
+                const auto eco_log_value_ = ::eco::log::detail::changeValue(value_);                             \
+                static thread_local ::eco::log::detail::ChangeTracker<                                           \
+                    ::std::remove_const_t<decltype(eco_log_value_)>>                                             \
+                    eco_log_tracker_;                                                                            \
+                if (!eco_log_tracker_.initialized) {                                                             \
+                    eco_log_tracker_.initialized = true;                                                         \
+                    eco_log_tracker_.previous = eco_log_value_;                                                  \
+                    using eco_log_tags_ = decltype(::eco::log::detail::tagList(eco_log_value_));                 \
+                    ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::OnChange, 0, name_ " = {}");                \
+                    ::eco::log::detail::Emitter{eco_log_site_, 0}(eco_log_value_);                              \
+                } else if (eco_log_tracker_.previous != eco_log_value_) {                                        \
+                    const auto eco_log_previous_ = eco_log_tracker_.previous;                                    \
+                    eco_log_tracker_.previous = eco_log_value_;                                                  \
+                    using eco_log_tags_ =                                                                        \
+                        decltype(::eco::log::detail::tagList(eco_log_previous_, eco_log_value_));                \
+                    ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::OnChange, 0, name_ ": {} -> {}");           \
+                    ::eco::log::detail::Emitter{eco_log_site_, ++eco_log_tracker_.changes}(eco_log_previous_,    \
+                                                                                             eco_log_value_);    \
+                }                                                                                                \
+            }                                                                                                    \
+        }                                                                                                        \
+    } while (false)
+
 // ---- 集計：毎回は書かず、期間（Config::statIntervalMs）ごとに 回数・合計・平均・最小・最大・最後 を1行で出す ----
 
 #if ECO_LOG_STATS
@@ -149,7 +181,25 @@
         (name_), __FILE__, __LINE__, ::eco::log::StatKind::Duration};                                               \
     ::eco::log::detail::ScopeTimer ECO_LOG_CAT_(eco_scope_timer_, __LINE__) { ECO_LOG_CAT_(eco_scope_site_, __LINE__) }
 
+// 値を集計し（ECO_STAT と同じ）、さらに最近の capacity 個をメモリーに覚えておく。ファイルには普段は書かず、
+// 落ちたとき・eco::log::dumpHistory("理由") を呼んだときに、フレーム番号・何ms前か と一緒に書き出す。
+#define ECO_HISTORY_N(name_, capacity_, value_)                                                                \
+    do {                                                                                                       \
+        static constinit ::eco::log::StatSite eco_stat_site_{(name_), __FILE__, __LINE__,                      \
+                                                             ::eco::log::StatKind::History, (capacity_)};      \
+        ::eco::log::detail::addHistory(eco_stat_site_, static_cast<double>(value_));                           \
+    } while (false)
+
+#define ECO_HISTORY(name_, value_) ECO_HISTORY_N(name_, 256, value_)
+
 #else
+
+#define ECO_HISTORY_N(name_, capacity_, value_) \
+    do {                                        \
+    } while (false)
+#define ECO_HISTORY(name_, value_) \
+    do {                           \
+    } while (false)
 
 #define ECO_STAT(name_, value_) \
     do {                        \

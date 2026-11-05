@@ -306,6 +306,10 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, s
         out.append("ms\",\"skipped\":");
         appendUnsigned(out, header.aux);
         break;
+    case Sampling::OnChange:
+        out.append(",\"sample\":\"on change\",\"change\":");
+        appendUnsigned(out, header.aux);
+        break;
     case Sampling::None: break;
     }
     out.append("}\n");

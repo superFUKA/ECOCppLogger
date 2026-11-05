@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "ECOCppLogger/Clock.h"
 #include "ECOCppLogger/Level.h"
@@ -57,6 +58,10 @@ Level level() noexcept;
 
 // 呼んだスレッドの名前（出力の "th"）。
 void setThreadName(std::string_view name);
+
+// ECO_HISTORY で覚えている最近の値を、すべてのスレッドの分ファイルへ書き出す（"lv":"history" の行）。
+// 呼んだ時刻より後の値は含めない。落ちたときは自動で書き出す。
+void dumpHistory(std::string_view reason);
 
 // フレームの区切り。記録に今のフレーム番号（"f"）が付く。
 void nextFrame() noexcept;
@@ -106,20 +111,54 @@ struct Emitter {
     }
 };
 
-inline void addStat(StatSite& site, double value) noexcept {
+inline StatSlot* statSlotFor(StatSite& site) noexcept {
     ThreadBuffer* buffer = threadBuffer();
     std::uint32_t index = site.index.load(std::memory_order_relaxed);
     if (index == 0) [[unlikely]] {
         index = Registry::instance().registerStat(site);
     }
     StatSlot* slot = buffer->statSlot(index);
+    if (slot && !slot->site.load(std::memory_order_relaxed)) [[unlikely]] {
+        slot->site.store(&site, std::memory_order_release);
+    }
+    return slot;
+}
+
+inline void addStat(StatSite& site, double value) noexcept {
+    if (StatSlot* slot = statSlotFor(site)) [[likely]] {
+        slot->add(value, g_statEpoch.load(std::memory_order_relaxed));
+    }
+}
+
+HistoryRing* createHistory(StatSlot& slot, const StatSite& site);
+
+// 集計に足し、最近の値として覚えておく（ECO_HISTORY）。
+inline void addHistory(StatSite& site, double value) noexcept {
+    StatSlot* slot = statSlotFor(site);
     if (!slot) [[unlikely]] {
         return;
     }
-    if (!slot->site.load(std::memory_order_relaxed)) [[unlikely]] {
-        slot->site.store(&site, std::memory_order_release);
-    }
     slot->add(value, g_statEpoch.load(std::memory_order_relaxed));
+    HistoryRing* ring = slot->history.load(std::memory_order_relaxed);
+    if (!ring) [[unlikely]] {
+        ring = createHistory(*slot, site);
+    }
+    ring->push(value, ticks(), g_frame.load(std::memory_order_relaxed));
+}
+
+// ECO_LOG_ON_CHANGE：呼び出し位置・スレッドごとに、前の値を覚えておく。
+template <class T>
+struct ChangeTracker {
+    bool initialized = false;
+    T previous{};
+    std::uint64_t changes = 0;
+};
+
+template <class T>
+constexpr T changeValue(const T& value) noexcept {
+    static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T> || std::is_pointer_v<T>,
+                  "ECOCppLogger: ECO_LOG_ON_CHANGE に渡せるのは 数値・bool・enum・ポインター です");
+    return value;
 }
 
 // 区間の時間を ticks で集計に足す（ECO_SCOPE_TIME）。

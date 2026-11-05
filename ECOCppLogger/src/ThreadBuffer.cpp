@@ -5,6 +5,7 @@
 #include <new>
 
 #include "CrashHandler.h"
+#include "ECOCppLogger/Logger.h"
 
 namespace eco::log {
 
@@ -26,6 +27,13 @@ struct Retirer {
 thread_local Retirer t_retirer;
 
 }  // namespace
+
+HistoryRing::HistoryRing(std::size_t capacity)
+    : mask_(std::bit_ceil(std::max<std::size_t>(capacity, 1)) - 1), entries_(new HistoryEntry[mask_ + 1]) {}
+
+HistoryRing::~HistoryRing() {
+    delete[] entries_;
+}
 
 ThreadBuffer::ThreadBuffer(std::size_t capacityBytes, std::uint32_t index)
     : capacity_(std::bit_ceil(std::max<std::size_t>(capacityBytes, 4096))), index_(index) {
@@ -102,6 +110,12 @@ std::uint32_t Registry::registerStat(StatSite& site) noexcept {
 }
 
 namespace detail {
+
+HistoryRing* createHistory(StatSlot& slot, const StatSite& site) {
+    auto* ring = new HistoryRing(site.historyCapacity);
+    slot.history.store(ring, std::memory_order_release);
+    return ring;
+}
 
 void setThreadBufferBytes(std::size_t bytes) noexcept {
     g_threadBufferBytes.store(bytes, std::memory_order_relaxed);

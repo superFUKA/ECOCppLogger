@@ -81,6 +81,11 @@ void singleThread() {
             [](int i) { ECO_LOG_EVERY_N(Level::Debug, 1000, "step {}", i); });
     perCall("ECO_STAT（値の集計）", kRounds, kBatch, [](int i) { ECO_STAT("bench.value", i); });
     perCall("ECO_COUNT（回数）", kRounds, kBatch, [](int) { ECO_COUNT("bench.count"); });
+    perCall("ECO_LOG_ON_CHANGE（値が変わらない回）", kRounds, kBatch,
+            [](int i) { ECO_LOG_ON_CHANGE(Level::Info, "bench.state", i / 1000000); });
+    perCall("ECO_LOG_ON_CHANGE（100回に1回変わる）", kRounds, kBatch,
+            [](int i) { ECO_LOG_ON_CHANGE(Level::Info, "bench.state2", i / 100); });
+    perCall("ECO_HISTORY（最近の値を覚える＋集計）", kRounds, kBatch, [](int i) { ECO_HISTORY("bench.history", i); });
     perCall("ECO_SCOPE_TIME（区間の時間）", kRounds, kBatch, [](int i) {
         ECO_SCOPE_TIME("bench.scope");
         g_sink.fetch_add(i, std::memory_order_relaxed);

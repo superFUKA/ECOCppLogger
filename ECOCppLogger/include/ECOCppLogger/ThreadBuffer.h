@@ -13,6 +13,7 @@
 #include <atomic>
 
 #include "ECOCppLogger/Record.h"
+#include "ECOCppLogger/Stat.h"
 
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
@@ -86,6 +87,20 @@ public:
         return chunk[site % kStateChunkSize];
     }
 
+    // 集計の置き場所（番号は台帳が振る。1〜）。取れなければ nullptr（その値は数えない）。
+    StatSlot* statSlot(uint32_t index) noexcept {
+        const uint32_t chunkIndex = index / kStatChunkSlots;
+        if (chunkIndex >= kStatChunks) [[unlikely]] {
+            return nullptr;
+        }
+        StatChunk* chunk = statChunks_[chunkIndex].load(std::memory_order_relaxed);
+        if (!chunk) [[unlikely]] {
+            chunk = createStatChunk(chunkIndex);
+            if (!chunk) return nullptr;
+        }
+        return &chunk->slots[index % kStatChunkSlots];
+    }
+
     // ---- 書き出す側が使う ------------------------------------------------------------------------------
 
     // まだ読んでいない部分を、続いているバイト列ごとに callback(data, size) に渡す（多くて2回：終わりで折り返すため）。
@@ -106,6 +121,18 @@ public:
         return total;
     }
 
+    // 使われている集計すべてに callback(StatSlot&) を呼ぶ。
+    template <class Callback>
+    void forEachStat(Callback&& callback) {
+        for (auto& entry : statChunks_) {
+            StatChunk* chunk = entry.load(std::memory_order_acquire);
+            if (!chunk) continue;
+            for (StatSlot& slot : chunk->slots) {
+                if (slot.site.load(std::memory_order_acquire)) callback(slot);
+            }
+        }
+    }
+
     bool empty() const noexcept {
         return read_.load(std::memory_order_acquire) == write_.load(std::memory_order_acquire);
     }
@@ -123,7 +150,10 @@ public:
 private:
     SiteState* createStateChunk(uint32_t site) noexcept;
 
+    StatChunk* createStatChunk(uint32_t chunkIndex) noexcept;
+
     SiteState* stateChunks_[kStateChunks] = {};
+    std::atomic<StatChunk*> statChunks_[kStatChunks] = {};
 
     // 持ち主のスレッドが書く側
     alignas(64) std::atomic<uint64_t> write_{0};

@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <new>
 
 #include "Registry.h"
 #include "Writer.h"
@@ -14,6 +15,17 @@ std::atomic<uint8_t> g_level{static_cast<uint8_t>(Level::Trace)};
 std::atomic<uint64_t> g_frame{0};
 std::atomic<bool> g_recordTime{true};
 std::atomic<bool> g_recordFrame{true};
+std::atomic<uint64_t> g_statEpoch{1};
+
+uint32_t registerStat(StatSite& site) noexcept {
+    return Registry::instance().registerStat(site);
+}
+
+HistoryRing* createHistory(StatSlot& slot, const StatSite& site) noexcept {
+    auto* ring = new (std::nothrow) HistoryRing(site.historyCapacity);
+    slot.history.store(ring, std::memory_order_release);
+    return ring;
+}
 
 }  // namespace detail
 
@@ -92,6 +104,10 @@ void nextFrame() noexcept {
     }
     memcpy(cursor, &frame, 8);
     buffer->commit();
+}
+
+void dumpHistory(const char* reason) {
+    detail::writer().dumpHistory(reason ? reason : "");
 }
 
 uint64_t frame() noexcept {

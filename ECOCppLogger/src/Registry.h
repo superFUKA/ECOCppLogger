@@ -38,6 +38,9 @@ public:
     uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept;
     const Site* site(uint32_t id) const noexcept;
 
+    // 集計の呼び出し位置に番号を振る（1〜。足りなければ 0 で、その集計は数えない）。
+    uint32_t registerStat(StatSite& site) noexcept;
+
 private:
     static constexpr size_t kSiteChunkSize = 1024;
     static constexpr size_t kSiteChunks = 1024;  // 呼び出し位置は最大 約100万か所
@@ -52,6 +55,7 @@ private:
     std::mutex siteMutex_;
     uint32_t nextSiteId_ = 1;
     std::atomic<std::atomic<const Site*>*> siteChunks_[kSiteChunks]{};
+    uint32_t nextStatIndex_ = 1;
 };
 
 }  // namespace lg::detail

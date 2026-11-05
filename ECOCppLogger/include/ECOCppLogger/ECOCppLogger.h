@@ -11,7 +11,8 @@
 // 書式：{} の数は引数と同じ（違えばコンパイルエラー）。{名前}・{名前:書式}（.3＝小数3桁、x＝16進、08＝0埋め8桁）。
 //       書式は文字列リテラル。{{ と }} は { と } そのもの。
 // 引数：bool・char・整数・浮動小数点・enum・文字列（const char*・std::string 等）・ポインター・ECO_LOG_FIELDS の型。
-// 毎フレーム何万回も通る所：ECO_LOG_EVERY_N・FIRST_N・ONCE・EVERY_MS・ON_CHANGE・ECO_LOG_BATCH。
+// 毎フレーム何万回も通る所：ECO_LOG_EVERY_N・FIRST_N・ONCE・EVERY_MS・ON_CHANGE・ECO_LOG_BATCH、
+//                         集計 ECO_STAT・ECO_STAT_COUNT・ECO_STAT_TIME・ECO_STAT_HISTORY。
 // 見る：ECOCppLoggerView <フォルダー>（人向け）、--json（LLM 向け）。
 
 #include <source_location>
@@ -263,6 +264,39 @@
 #define ECO_FRAME() ((void)0)
 
 #endif  // ECO_LOG_ENABLE
+
+// ---- 集計：毎回は書かず、期間（Config::statIntervalMs）ごとに 回数・平均・最小・最大・最後 を1行で出す ----------
+// 重さに関係なく数える。ECO_LOG_STATS=0 で消える（既定は ECO_LOG_ENABLE と同じ）。name は文字列リテラル。
+
+#ifndef ECO_LOG_STATS
+#define ECO_LOG_STATS ECO_LOG_ENABLE
+#endif
+
+#if ECO_LOG_STATS
+
+#define ECO_LOG_STAT_SITE_(name_, kind_, capacity_)     static constinit ::lg::StatSite eco_stat_site_ { (name_), __FILE__, __LINE__, (kind_), (capacity_) }
+
+// 値を集計する（約2ns）。
+#define ECO_STAT(name_, value_)                                                           do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, 0);                                  ::lg::detail::addStat(eco_stat_site_, static_cast<double>(value_));               } while (false)
+
+// 通った回数を数える（出力は回数と1秒あたり）。
+#define ECO_STAT_COUNT(name_)                                                             do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Count, 0);                                  ::lg::detail::addStat(eco_stat_site_, 1.0);                                       } while (false)
+
+// この行からスコープの終わりまでの時間を集計する（出力はマイクロ秒）。
+#define ECO_STAT_TIME(name_)                                                                                        static constinit ::lg::StatSite ECO_LOG_CAT_(eco_stat_time_site_, __LINE__){(name_), __FILE__, __LINE__,                                                                                    ::lg::StatKind::Time, 0};          ::lg::detail::StatTimer ECO_LOG_CAT_(eco_stat_timer_, __LINE__) { ECO_LOG_CAT_(eco_stat_time_site_, __LINE__) }
+
+// 値を集計し（ECO_STAT と同じ）、さらに最近の capacity 個をスレッドごとに覚えておく。ファイルには普段は書かず、
+// lg::dumpHistory("理由") を呼んだとき・落ちたときに、何ms前か・フレーム番号と一緒に書き出す。
+#define ECO_STAT_HISTORY(name_, capacity_, value_)                                        do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, (capacity_));                        ::lg::detail::addHistory(eco_stat_site_, static_cast<double>(value_));            } while (false)
+
+#else  // ECO_LOG_STATS
+
+#define ECO_STAT(...) ((void)0)
+#define ECO_STAT_COUNT(...) ((void)0)
+#define ECO_STAT_TIME(...) ((void)0)
+#define ECO_STAT_HISTORY(...) ((void)0)
+
+#endif  // ECO_LOG_STATS
 
 #define ECO_LOG_TRACE(...) ECO_LOG_EXPAND_(ECO_LOG(::lg::Level::Trace, __VA_ARGS__))
 #define ECO_LOG_DEBUG(...) ECO_LOG_EXPAND_(ECO_LOG(::lg::Level::Debug, __VA_ARGS__))

@@ -53,14 +53,21 @@ void setThreadName(const char* name);
 void nextFrame() noexcept;
 uint64_t frame() noexcept;
 
+// ECO_STAT_HISTORY で覚えている最近の値を、すべてのスレッドの分 書き出す（"lv":"history" の行。次の writeOut() で書く）。
+// 値は呼んだときに写し取る（その後に上書きされても残る）。落ちたときは自動で書き出す。
+void dumpHistory(const char* reason);
+
 namespace detail {
 
 extern std::atomic<uint8_t> g_level;
 extern std::atomic<uint64_t> g_frame;
 extern std::atomic<bool> g_recordTime;
 extern std::atomic<bool> g_recordFrame;
+extern std::atomic<uint64_t> g_statEpoch;  // 集計の期間（書き出すたびに進む）
 
 uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept;
+uint32_t registerStat(StatSite& site) noexcept;
+HistoryRing* createHistory(StatSlot& slot, const StatSite& site) noexcept;
 
 inline bool isEnabled(Level level) noexcept {
     return static_cast<uint8_t>(level) >= g_level.load(std::memory_order_relaxed);
@@ -211,6 +218,54 @@ inline bool observeChange(const Site& site, SiteIdSlot& slot, const N& value, ui
     change = state.count++;
     return true;
 }
+
+// ---- 集計 ---------------------------------------------------------------------------------------------
+
+inline StatSlot* statSlotFor(StatSite& site) noexcept {
+    uint32_t index = site.index.load(std::memory_order_relaxed);
+    if (index == 0) [[unlikely]] {
+        index = registerStat(site);
+    }
+    StatSlot* slot = threadBuffer()->statSlot(index);
+    if (slot && !slot->site.load(std::memory_order_relaxed)) [[unlikely]] {
+        slot->site.store(&site, std::memory_order_release);
+    }
+    return slot;
+}
+
+inline void addStat(StatSite& site, double value) noexcept {
+    if (StatSlot* slot = statSlotFor(site)) [[likely]] {
+        slot->add(value, g_statEpoch.load(std::memory_order_relaxed));
+    }
+}
+
+// 集計に足し、最近の値としても覚える（ECO_STAT_HISTORY）。
+inline void addHistory(StatSite& site, double value) noexcept {
+    StatSlot* slot = statSlotFor(site);
+    if (!slot) [[unlikely]] {
+        return;
+    }
+    slot->add(value, g_statEpoch.load(std::memory_order_relaxed));
+    HistoryRing* ring = slot->history.load(std::memory_order_relaxed);
+    if (!ring) [[unlikely]] {
+        ring = createHistory(*slot, site);
+        if (!ring) return;
+    }
+    ring->push(value, ticks(), g_frame.load(std::memory_order_relaxed));
+}
+
+// ECO_STAT_TIME：作ってから壊すまでの時間（TSC の差のまま足す。出すときにマイクロ秒にする）。
+class StatTimer {
+public:
+    explicit StatTimer(StatSite& site) noexcept : site_(site), start_(ticks()) {}
+    ~StatTimer() { addStat(site_, static_cast<double>(ticks() - start_)); }
+    StatTimer(const StatTimer&) = delete;
+    StatTimer& operator=(const StatTimer&) = delete;
+
+private:
+    StatSite& site_;
+    uint64_t start_;
+};
 
 // ---- まとめ書き ------------------------------------------------------------------------------------------
 

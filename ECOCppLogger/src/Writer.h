@@ -17,6 +17,7 @@
 
 #include "ECOCppLogger/Clock.h"
 #include "ECOCppLogger/Config.h"
+#include "ECOCppLogger/ThreadBuffer.h"
 #include "FileFormat.h"
 #include "Format.h"
 
@@ -35,6 +36,9 @@ public:
 
     // めったにない行を書き出し先へ（集計・最近の値 等は後の工程で使う）。io の中で呼ぶ。
     void writeEvent(EventKind kind, uint64_t tick, std::string_view body);
+
+    // 最近の値を写し取り、次の writeOut()・stop() で書く（lg::dumpHistory）。
+    void dumpHistory(std::string_view reason);
 
 private:
     struct Output {
@@ -78,6 +82,22 @@ private:
     void drain(bool emergency);
     void writeConsole(const RecordHeader& header, std::string_view thread);
 
+    // 集計（WriterStats.cpp）
+    struct StatTotal {
+        const StatSite* site = nullptr;  // 同じ名前の集計は、呼び出し位置が違ってもまとめる（src は最初の位置）
+        uint64_t count = 0;
+        double sum = 0.0;
+        double minimum = 0.0;
+        double maximum = 0.0;
+        double last = 0.0;
+    };
+    using StatTotals = std::unordered_map<std::string_view, StatTotal>;
+    static void collectStats(ThreadBuffer& buffer, uint64_t epoch, StatTotals& totals);
+    void foldRetiredStats(ThreadBuffer& buffer);  // 終わったスレッドの分を、次に出すまで取っておく
+    void reportStats(bool force);                 // 期間が来ていれば（force なら必ず）集計を出す
+    void writePending();                          // dumpHistory で写し取った行を書く
+    double ticksToMicroseconds(double ticks) const;
+
     std::mutex io_;
     bool running_ = false;
     Config config_;
@@ -89,6 +109,10 @@ private:
     std::string event_;
     uint64_t records_ = 0;
     uint64_t dropped_ = 0;
+
+    StatTotals carried_;
+    uint64_t lastStatNanoseconds_ = 0;
+    std::vector<std::pair<uint64_t, std::string>> pendingHistory_;  // 時刻と中身
 };
 
 Writer& writer();

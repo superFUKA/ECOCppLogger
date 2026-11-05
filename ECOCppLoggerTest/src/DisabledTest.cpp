@@ -33,6 +33,10 @@ TEST(Disabled, MacrosLeaveNoCode) {
     ECO_LOG_BATCH(batch, Info, "disabled batch {}", int);
     batch.add(1);
     EXPECT_FALSE(batch.enabled());
+    ECO_STAT("disabled.stat", sideEffect());
+    ECO_STAT_COUNT("disabled.count");
+    ECO_STAT_TIME("disabled.time");
+    ECO_STAT_HISTORY("disabled.history", 4, sideEffect());
     EXPECT_EQ(g_evaluated, 0);  // 引数も評価しない
     EXPECT_EQ(lgtest::countContaining(session.lines(), "disabled"), 0u);
 }

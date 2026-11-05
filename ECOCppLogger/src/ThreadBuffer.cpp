@@ -28,6 +28,15 @@ ThreadBuffer::~ThreadBuffer() {
     for (SiteState* chunk : stateChunks_) {
         delete[] chunk;
     }
+    for (auto& chunk : statChunks_) {
+        delete chunk.load(std::memory_order_relaxed);
+    }
+}
+
+StatChunk* ThreadBuffer::createStatChunk(uint32_t chunkIndex) noexcept {
+    auto* chunk = new (std::nothrow) StatChunk();
+    statChunks_[chunkIndex].store(chunk, std::memory_order_release);
+    return chunk;
 }
 
 ThreadBuffer::SiteState* ThreadBuffer::createStateChunk(uint32_t site) noexcept {
@@ -181,6 +190,16 @@ uint32_t Registry::registerSite(const Site& site, SiteIdSlot& slot) noexcept {
     ++nextSiteId_;
     slot.store(id, std::memory_order_release);
     return id;
+}
+
+uint32_t Registry::registerStat(StatSite& site) noexcept {
+    std::lock_guard lock(siteMutex_);
+    uint32_t index = site.index.load(std::memory_order_relaxed);
+    if (index == 0 && nextStatIndex_ < kStatChunks * kStatChunkSlots) {
+        index = nextStatIndex_++;
+        site.index.store(index, std::memory_order_relaxed);
+    }
+    return index;
 }
 
 const Site* Registry::site(uint32_t id) const noexcept {

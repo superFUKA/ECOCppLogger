@@ -328,6 +328,7 @@ bool Writer::start(const Config& config) {
                 std::to_string(processId());
     records_ = 0;
     dropped_ = 0;
+    lastStatNanoseconds_ = steadyNanoseconds();
 
     outputs_.clear();
     const Destination all{};
@@ -360,6 +361,8 @@ void Writer::stop() {
     }
     running_ = false;
     drain(false);
+    reportStats(true);
+    writePending();
     writeSessionEnd(false);
     flushAll(true);
 }
@@ -370,6 +373,8 @@ void Writer::writeOut() {
         return;
     }
     drain(false);
+    reportStats(false);
+    writePending();
     flushAll(false);
 }
 
@@ -475,6 +480,7 @@ void Writer::drain(bool emergency) {
             buffer->reportedDropped = dropped;
         }
         if (retired && buffer->empty()) {
+            if (!emergency) foldRetiredStats(*buffer);
             finished.push_back(buffer);
         }
     }

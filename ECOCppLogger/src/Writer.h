@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <atomic>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -42,6 +43,13 @@ public:
 
     // めったにない行を取っておき、次の writeOut()・stop() で書く（どのスレッドからでも）。
     void queueEvent(EventKind kind, uint64_t tick, std::string body);
+
+    // 落ちたとき：落ちた理由の行（extraJson は "," で始まる "key":value の並び）・残っている記録・集計・最近の値を、
+    // 呼んだスレッドで書いて閉じる。書き出しの途中で落ちたときは、少し待ってからロックなしで書く。
+    void emergency(std::string_view reason, const std::string& extraJson) noexcept;
+
+    // minidump を置く場所（start() の後。ログのファイルと同じ名前で .dmp）。
+    std::wstring crashDumpPath() const;
 
 private:
     struct Output {
@@ -99,9 +107,12 @@ private:
     void foldRetiredStats(ThreadBuffer& buffer);  // 終わったスレッドの分を、次に出すまで取っておく
     void reportStats(bool force);                 // 期間が来ていれば（force なら必ず）集計を出す
     void writePending();                          // 取っておいた行（dumpHistory・queueEvent）を書く
+    void captureHistory(std::string_view reason);  // 最近の値を写し取って取っておく（io_ の中で）
     double ticksToMicroseconds(double ticks) const;
 
-    std::mutex io_;
+    std::timed_mutex io_;
+    std::atomic<bool> crashed_{false};
+    std::filesystem::path crashDumpPath_;
     bool running_ = false;
     Config config_;
     std::string directory_;

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <new>
 
+#include "Crash.h"
 #include "Registry.h"
 #include "Stack.h"
 #include "Writer.h"
@@ -49,6 +50,9 @@ bool start(const Config& config) {
     setAssertAction(config.assertAction);
     if (!detail::writer().start(config)) {
         return false;
+    }
+    if (config.crash.handler) {
+        detail::installCrashHandler(config.crash);
     }
     static std::once_flag registerExit;
     std::call_once(registerExit, [] { std::atexit(stopAtExit); });

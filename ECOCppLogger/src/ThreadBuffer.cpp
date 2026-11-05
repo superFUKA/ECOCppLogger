@@ -4,6 +4,7 @@
 #include <bit>
 #include <new>
 
+#include "Crash.h"
 #include "Registry.h"
 
 #if defined(_WIN32)
@@ -102,6 +103,7 @@ ThreadBuffer* threadBufferSlow() noexcept {
     ThreadHolder& holder = t_holder;  // 非インラインなので、毎回今のスレッドのものを読む
     if (!holder.buffer) {
         holder.buffer = Registry::instance().create(currentOsThreadId());
+        installThreadCrashHandler();  // std::set_terminate はスレッドごと（MSVC）
 #if ECO_LOG_TLS_SLOT
         if (g_tlsIndex != TLS_OUT_OF_INDEXES) {
             TlsSetValue(g_tlsIndex, holder.buffer);

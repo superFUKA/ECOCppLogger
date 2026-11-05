@@ -1,6 +1,7 @@
 #include "Writer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "ECOCppLogger/Logger.h"
@@ -326,6 +327,8 @@ bool Writer::start(const Config& config) {
     baseName_ = stem + "_" + started.substr(0, 4) + started.substr(5, 2) + started.substr(8, 2) + "-" +
                 started.substr(11, 2) + started.substr(14, 2) + started.substr(17, 2) + "_" +
                 std::to_string(processId());
+    crashDumpPath_ = fromUtf8(directory_) / fromUtf8(baseName_ + ".dmp");
+    crashed_.store(false);
     records_ = 0;
     dropped_ = 0;
     lastStatNanoseconds_ = steadyNanoseconds();
@@ -376,6 +379,42 @@ void Writer::writeOut() {
     reportStats(false);
     writePending();
     flushAll(false);
+}
+
+void Writer::emergency(std::string_view reason, const std::string& extraJson) noexcept {
+    if (crashed_.exchange(true)) {
+        return;
+    }
+    // 書き出しの途中なら少し待つ。取れなくても書く（落ちる前に残すことを優先する）。
+    const bool locked = io_.try_lock_for(std::chrono::milliseconds(500));
+    try {
+        if (running_) {
+            // まず落ちたことを書いてディスクへ出す（この後で落ちても残るように）。
+            event_ = "\"lv\":\"fatal\",\"event\":\"crash\",\"reason\":";
+            appendJsonString(event_, reason);
+            event_.append(",\"f\":");
+            appendUnsigned(event_, g_frame.load(std::memory_order_relaxed));
+            event_.append(extraJson);
+            writeEvent(EventKind::Event, ticks(), event_);
+            flushAll(false);
+            // 残っている記録は書き写すだけ（落ちている最中に文字列を作らない）。
+            drain(true);
+            reportStats(true);
+            captureHistory("crash");
+            writePending();
+            running_ = false;
+            writeSessionEnd(true);
+            flushAll(true);
+        }
+    } catch (...) {
+    }
+    if (locked) {
+        io_.unlock();
+    }
+}
+
+std::wstring Writer::crashDumpPath() const {
+    return crashDumpPath_.wstring();
 }
 
 const char* Writer::currentFile(const char* destination) {

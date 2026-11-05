@@ -87,7 +87,7 @@ void Writer::reportStats(bool force) {
     const uint64_t epoch = g_statEpoch.fetch_add(1, std::memory_order_acq_rel);
     StatTotals totals = std::move(carried_);
     carried_.clear();
-    for (auto& entry : Registry::instance().snapshot()) {
+    for (auto& entry : Registry::instance().snapshot(crashed_.load(std::memory_order_relaxed))) {
         collectStats(*entry.buffer, epoch, totals);
     }
     if (totals.empty()) {
@@ -134,9 +134,13 @@ void Writer::reportStats(bool force) {
 
 void Writer::dumpHistory(std::string_view reason) {
     std::lock_guard lock(io_);  // 書き出しがバッファを片付けている間は待つ
+    captureHistory(reason);
+}
+
+void Writer::captureHistory(std::string_view reason) {
     const uint64_t now = ticks();
     const double perMillisecond = ticksPerMillisecond();
-    for (auto& entry : Registry::instance().snapshot()) {
+    for (auto& entry : Registry::instance().snapshot(crashed_.load(std::memory_order_relaxed))) {
         entry.buffer->forEachStat([&](StatSlot& slot) {
             const HistoryRing* ring = slot.history.load(std::memory_order_acquire);
             const StatSite* site = slot.site.load(std::memory_order_acquire);

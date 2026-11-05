@@ -4,4 +4,5 @@
 
 # CppBuildの中間ファイル・成果物
 /.ecobuild/.cppbuild/output/
-C:/Program Files/Git/.ecobuild/ai/
+# エージェントのメモ・下書き（コミットしない）
+/.ecobuild/ai/

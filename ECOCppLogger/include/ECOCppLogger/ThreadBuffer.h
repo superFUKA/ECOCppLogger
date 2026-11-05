@@ -152,8 +152,7 @@ public:
         if (size > contiguous) {
             // 終わりまでの残りを詰め物にして、先頭から書く。
             auto* padding = reinterpret_cast<RecordHeader*>(data_ + offset);
-            padding->size = static_cast<std::uint32_t>(contiguous);
-            padding->kind = RecordKind::Padding;
+            *padding = RecordHeader{static_cast<std::uint16_t>(contiguous), RecordKind::Padding, 0, 0};
             pendingWrite_ = write + contiguous + size;
             return data_;
         }
@@ -292,12 +291,22 @@ public:
 
     std::uint32_t registerStat(StatSite& site) noexcept;
 
+    // ログの呼び出し位置に番号を振る（最初の1回だけ）。番号 → Site は裏のスレッド・読む側の対応表に使う。
+    std::uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept;
+    const Site* siteById(std::uint32_t id) const noexcept;
+
+    static constexpr std::size_t kSiteChunkSize = 1024;
+    static constexpr std::size_t kSiteChunks = 1024;  // 呼び出し位置は最大 約100万か所
+
     std::mutex mutex;
 
 private:
     std::vector<std::unique_ptr<ThreadBuffer>> buffers_;
     std::uint32_t nextThreadIndex_ = 0;
     std::atomic<std::uint32_t> nextStatIndex_{1};  // 0 は「まだ振っていない」
+    std::mutex siteMutex_;
+    std::uint32_t nextSiteId_ = 1;
+    std::atomic<std::atomic<const Site*>*> siteChunks_[kSiteChunks]{};
 };
 
 namespace detail {

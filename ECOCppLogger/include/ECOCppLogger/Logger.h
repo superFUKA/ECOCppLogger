@@ -94,26 +94,49 @@ inline bool isEnabled(Level level) noexcept {
     return static_cast<std::uint8_t>(level) >= g_level.load(std::memory_order_relaxed);
 }
 
-template <class... Normalized>
-inline void emitNormalized(const Site& site, std::uint64_t aux, const Normalized&... values) noexcept {
+inline bool recordTime() noexcept {
+#if ECO_LOG_RECORD_TIME
+    return g_recordTime.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+inline std::uint32_t siteId(const Site& site, SiteIdSlot& slot) noexcept {
+    std::uint32_t id = slot.load(std::memory_order_relaxed);
+    if (id == 0) [[unlikely]] {
+        id = Registry::instance().registerSite(site, slot);
+    }
+    return id;
+}
+
+// 1件：頭（8）［＋時刻（8）］［＋間引きの情報（8）］＋引数。
+template <bool HasAux, class... Normalized>
+inline void emitNormalized(const Site& site, SiteIdSlot& slot, std::uint64_t aux, const Normalized&... values) noexcept {
     ThreadBuffer* buffer = threadBuffer();
-    const std::size_t size = alignRecord(sizeof(RecordHeader) + (std::size_t{0} + ... + encodedSize(values)));
-    std::byte* out = buffer->reserve(size);
+    const std::uint32_t id = siteId(site, slot);
+    const bool withTime = recordTime();
+    const std::size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + (HasAux ? 8 : 0) +
+                                         (std::size_t{0} + ... + encodedSize(values)));
+    std::byte* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size) : nullptr;
     if (!out) [[unlikely]] {
         buffer->countDrop();
         return;
     }
-#if ECO_LOG_RECORD_TIME
-    const std::uint64_t tick = g_recordTime.load(std::memory_order_relaxed) ? ticks() : 0;
-#else
-    const std::uint64_t tick = 0;
-#endif
-    const std::uint64_t frameNumber = g_recordFrame.load(std::memory_order_relaxed)
-                                          ? g_frame.load(std::memory_order_relaxed)
-                                          : 0;
-    RecordHeader header{static_cast<std::uint32_t>(size), RecordKind::Log, tick, frameNumber, &site, aux};
+    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Log,
+                              static_cast<std::uint8_t>((withTime ? kRecordHasTick : 0) | (HasAux ? kRecordHasAux : 0)),
+                              id};
     std::memcpy(out, &header, sizeof(header));
     std::byte* cursor = out + sizeof(RecordHeader);
+    if (withTime) {
+        const std::uint64_t tick = ticks();
+        std::memcpy(cursor, &tick, 8);
+        cursor += 8;
+    }
+    if constexpr (HasAux) {
+        std::memcpy(cursor, &aux, 8);
+        cursor += 8;
+    }
     ((cursor = encode(cursor, values)), ...);
     buffer->commit();
     if (site.level >= Level::Error) [[unlikely]] {
@@ -121,16 +144,116 @@ inline void emitNormalized(const Site& site, std::uint64_t aux, const Normalized
     }
 }
 
-// マクロが作る呼び出し口：Emitter{site, aux}(引数...)。引数がなくても () で呼べる。
+// マクロが作る呼び出し口：Emitter{site, id}(引数...)。引数がなくても () で呼べる。
 struct Emitter {
     const Site& site;
-    std::uint64_t aux = 0;
+    SiteIdSlot& id;
 
     template <class... Args>
     void operator()(const Args&... args) const noexcept {
-        emitNormalized(site, aux, normalize(args)...);
+        emitNormalized<false>(site, id, 0, normalize(args)...);
     }
 };
+
+// 間引くログ：間引きの情報（何回目か・省いた数）を付ける。
+struct SampledEmitter {
+    const Site& site;
+    SiteIdSlot& id;
+    std::uint64_t aux;
+
+    template <class... Args>
+    void operator()(const Args&... args) const noexcept {
+        emitNormalized<true>(site, id, aux, normalize(args)...);
+    }
+};
+
+// まとめ書きの塊を1件として書く。
+inline void writeBatch(const Site& site, SiteIdSlot& slot, std::uint64_t startTick, std::uint32_t count,
+                       std::uint32_t elementSize, const std::byte* elements) noexcept {
+    ThreadBuffer* buffer = threadBuffer();
+    const std::uint32_t id = siteId(site, slot);
+    const bool withTime = startTick != 0;
+    const std::size_t bytes = static_cast<std::size_t>(count) * elementSize;
+    const std::size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + sizeof(BatchInfo) + bytes);
+    std::byte* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size) : nullptr;
+    if (!out) [[unlikely]] {
+        buffer->countDrop();
+        return;
+    }
+    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Batch,
+                              static_cast<std::uint8_t>(withTime ? kRecordHasTick : 0), id};
+    std::memcpy(out, &header, sizeof(header));
+    std::byte* cursor = out + sizeof(RecordHeader);
+    if (withTime) {
+        std::memcpy(cursor, &startTick, 8);
+        cursor += 8;
+    }
+    const BatchInfo info{count, elementSize, withTime ? ticks() : 0};
+    std::memcpy(cursor, &info, sizeof(info));
+    cursor += sizeof(info);
+    std::memcpy(cursor, elements, bytes);
+    buffer->commit();
+}
+
+}  // namespace detail
+
+// まとめ書き（ECO_LOG_BATCH が作る）。同じ書式のログが続く前提で、1件ごとには頭も時刻も付けず、
+// 引数の値だけを手元（スタック）の場所に並べる。一杯になったとき・スコープの終わりに、まとめて1件として書く。
+// 1件の追加は 一杯かの確認＋値のコピー だけ。引数はすべて決まった大きさの型（文字列は不可）。
+template <class... Types>
+class Batch {
+    static_assert(sizeof...(Types) > 0, "ECOCppLogger: ECO_LOG_BATCH には引数の型を1つ以上書いてください");
+    static_assert((!std::is_same_v<detail::Normalized<Types>, std::string_view> && ...),
+                  "ECOCppLogger: ECO_LOG_BATCH の引数に文字列は使えません（数値・bool・char・enum・ポインター）");
+
+public:
+    static constexpr std::size_t kElementSize = (std::size_t{0} + ... + detail::fixedEncodedSize<detail::Normalized<Types>>());
+    static constexpr std::size_t kScratchBytes = 8192;
+    static constexpr std::uint32_t kCapacity = static_cast<std::uint32_t>(
+        kScratchBytes / kElementSize > 0 ? kScratchBytes / kElementSize : 1);
+
+    Batch(const Site& site, SiteIdSlot& id, bool compiled) noexcept
+        : site_(site), id_(id), enabled_(compiled && detail::isEnabled(site.level)) {}
+    ~Batch() { flush(); }
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+
+    void add(const Types&... values) noexcept {
+        if (!enabled_) {
+            return;
+        }
+        if (count_ == kCapacity) [[unlikely]] {
+            flush();
+        }
+        if (count_ == 0) {
+            startTick_ = detail::recordTime() ? ticks() : 0;
+        }
+        std::byte* cursor = scratch_ + static_cast<std::size_t>(count_) * kElementSize;
+        ((cursor = detail::encode(cursor, detail::normalize(values))), ...);
+        ++count_;
+    }
+
+    // 溜めた分を今すぐ書く（スコープの終わりでも書く）。
+    void flush() noexcept {
+        if (count_ == 0) {
+            return;
+        }
+        detail::writeBatch(site_, id_, startTick_, count_, static_cast<std::uint32_t>(kElementSize), scratch_);
+        count_ = 0;
+    }
+
+    bool enabled() const noexcept { return enabled_; }
+
+private:
+    const Site& site_;
+    SiteIdSlot& id_;
+    bool enabled_;
+    std::uint32_t count_ = 0;
+    std::uint64_t startTick_ = 0;
+    alignas(8) std::byte scratch_[kCapacity * kElementSize];
+};
+
+namespace detail {
 
 inline StatSlot* statSlotFor(StatSite& site) noexcept {
     ThreadBuffer* buffer = threadBuffer();

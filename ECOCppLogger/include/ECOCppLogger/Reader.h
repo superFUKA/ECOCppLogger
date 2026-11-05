@@ -24,6 +24,7 @@ struct ViewFilter {
     std::string thread;          // 空でなければ、このスレッドのログだけ（集計等の行は出す）
     std::string contains;        // 空でなければ、この文字列を含む行だけ
     bool fullPath = false;       // src にソースのフルパスを出す
+    std::size_t batchRows = 0;   // 文章で、まとめ書きの塊ごとに出す件数（0 なら全部。JSON は常に全部）
 };
 
 class LogReader {

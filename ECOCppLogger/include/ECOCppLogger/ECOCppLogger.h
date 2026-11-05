@@ -9,6 +9,8 @@
 //   ECO_SCOPE_TIME("physics.step");                      // 区間の時間を集計
 //   ECO_LOG_ON_CHANGE(eco::log::Level::Info, "player.state", state);   // 値が変わったときだけ
 //   ECO_HISTORY("player.hp", hp);                        // 最近の値を覚え、落ちたとき・dumpHistory() で書き出す
+//   ECO_LOG_BATCH(batch, eco::log::Level::Debug, "i={} d={}", int, float);  // ループ用のまとめ書き
+//   for (...) batch.add(i, d);
 //   eco::log::stop();
 //
 // 書式の {} は引数と同じ数にする（違えばコンパイルエラー）。書式は文字列リテラル。
@@ -39,7 +41,8 @@
         (lvl_), (fmt_), __FILE__, ::std::source_location::current().function_name(), __LINE__, eco_log_tags_::values,   \
             static_cast<::std::uint8_t>(eco_log_tags_::count), static_cast<::std::uint8_t>(sampling_),                 \
             static_cast<::std::uint64_t>(samplingValue_)                                                               \
-    }
+    };                                                                                                                 \
+    static constinit ::eco::log::SiteIdSlot eco_log_id_ { 0 }
 
 // ---- ログ ---------------------------------------------------------------------------------------------
 
@@ -49,7 +52,7 @@
             if (::eco::log::detail::isEnabled(lvl_)) {                                                  \
                 using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));               \
                 ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::None, 0, fmt_);                        \
-                ::eco::log::detail::Emitter{eco_log_site_}(__VA_ARGS__);                                \
+                ::eco::log::detail::Emitter{eco_log_site_, eco_log_id_}(__VA_ARGS__);                                \
             }                                                                                           \
         }                                                                                               \
     } while (false)
@@ -68,7 +71,7 @@
             if (::eco::log::detail::isEnabled(lvl_) && (cond_)) {                                       \
                 using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));               \
                 ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::None, 0, fmt_);                        \
-                ::eco::log::detail::Emitter{eco_log_site_}(__VA_ARGS__);                                \
+                ::eco::log::detail::Emitter{eco_log_site_, eco_log_id_}(__VA_ARGS__);                                \
             }                                                                                           \
         }                                                                                               \
     } while (false)
@@ -86,7 +89,7 @@
                 if (eco_log_n_ % static_cast<::std::uint64_t>(n_) == 0) {                               \
                     using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));           \
                     ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::EveryN, n_, fmt_);                 \
-                    ::eco::log::detail::Emitter{eco_log_site_, eco_log_n_ + 1}(__VA_ARGS__);            \
+                    ::eco::log::detail::SampledEmitter{eco_log_site_, eco_log_id_,eco_log_n_ + 1}(__VA_ARGS__);            \
                 }                                                                                       \
             }                                                                                           \
         }                                                                                               \
@@ -104,7 +107,7 @@
                     if (eco_log_n_ < static_cast<::std::uint64_t>(n_)) {                                \
                         using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));       \
                         ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::FirstN, n_, fmt_);             \
-                        ::eco::log::detail::Emitter{eco_log_site_, eco_log_n_ + 1}(__VA_ARGS__);        \
+                        ::eco::log::detail::SampledEmitter{eco_log_site_, eco_log_id_,eco_log_n_ + 1}(__VA_ARGS__);        \
                     }                                                                                   \
                 }                                                                                       \
             }                                                                                           \
@@ -123,7 +126,7 @@
                 if (eco_log_limiter_.allow(static_cast<::std::uint64_t>(ms_), eco_log_skipped_)) {      \
                     using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));           \
                     ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::EveryMs, ms_, fmt_);               \
-                    ::eco::log::detail::Emitter{eco_log_site_, eco_log_skipped_}(__VA_ARGS__);          \
+                    ::eco::log::detail::SampledEmitter{eco_log_site_, eco_log_id_,eco_log_skipped_}(__VA_ARGS__);          \
                 }                                                                                       \
             }                                                                                           \
         }                                                                                               \
@@ -145,19 +148,47 @@
                     eco_log_tracker_.previous = eco_log_value_;                                                  \
                     using eco_log_tags_ = decltype(::eco::log::detail::tagList(eco_log_value_));                 \
                     ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::OnChange, 0, name_ " = {}");                \
-                    ::eco::log::detail::Emitter{eco_log_site_, 0}(eco_log_value_);                              \
+                    ::eco::log::detail::SampledEmitter{eco_log_site_, eco_log_id_,0}(eco_log_value_);                              \
                 } else if (eco_log_tracker_.previous != eco_log_value_) {                                        \
                     const auto eco_log_previous_ = eco_log_tracker_.previous;                                    \
                     eco_log_tracker_.previous = eco_log_value_;                                                  \
                     using eco_log_tags_ =                                                                        \
                         decltype(::eco::log::detail::tagList(eco_log_previous_, eco_log_value_));                \
                     ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::OnChange, 0, name_ ": {} -> {}");           \
-                    ::eco::log::detail::Emitter{eco_log_site_, ++eco_log_tracker_.changes}(eco_log_previous_,    \
+                    ::eco::log::detail::SampledEmitter{eco_log_site_, eco_log_id_,++eco_log_tracker_.changes}(eco_log_previous_,    \
                                                                                              eco_log_value_);    \
                 }                                                                                                \
             }                                                                                                    \
         }                                                                                                        \
     } while (false)
+
+// ---- まとめ書き：毎フレーム何十万回も回るループの中で、同じ書式のログを続けて残す ------------------------------
+//
+//   ECO_LOG_BATCH(candidates, eco::log::Level::Debug, "candidate {} distance {}", int, float);
+//   for (int i = 0; i < n; ++i) {
+//       candidates.add(i, distance[i]);   // 頭も時刻も付けず、値だけを手元に並べる（1件 約1ns）
+//   }                                     // 一杯になったとき・スコープの終わりに、まとめて1件として書く
+//
+// 書式・呼び出し位置・時刻は塊（最大 8KB 分）ごとに1回だけ。見るときは、塊の始めと終わりの時刻・件数と、
+// 1件ずつの値が出る。引数は決まった大きさの型だけ（文字列は不可）。重さで切られていれば add は何もしない。
+#define ECO_LOG_BATCH(var_, lvl_, fmt_, ...)                                                                     \
+    static_assert(::eco::log::detail::countPlaceholders(fmt_) == ::eco::log::detail::BatchTags<__VA_ARGS__>::count, \
+                  "ECOCppLogger: 書式の {} の数と ECO_LOG_BATCH の型の数が合いません");                            \
+    static constexpr ::eco::log::Site ECO_LOG_CAT_(eco_batch_site_, __LINE__){                                   \
+        (lvl_),                                                                                                  \
+        (fmt_),                                                                                                  \
+        __FILE__,                                                                                                \
+        ::std::source_location::current().function_name(),                                                      \
+        __LINE__,                                                                                                \
+        ::eco::log::detail::BatchTags<__VA_ARGS__>::values,                                                      \
+        static_cast<::std::uint8_t>(::eco::log::detail::BatchTags<__VA_ARGS__>::count),                         \
+        0,                                                                                                       \
+        0};                                                                                                      \
+    static constinit ::eco::log::SiteIdSlot ECO_LOG_CAT_(eco_batch_id_, __LINE__){0};                           \
+    ::eco::log::Batch<__VA_ARGS__> var_ {                                                                        \
+        ECO_LOG_CAT_(eco_batch_site_, __LINE__), ECO_LOG_CAT_(eco_batch_id_, __LINE__),                          \
+            static_cast<int>(lvl_) >= ECO_LOG_COMPILE_LEVEL                                                      \
+    }
 
 // ---- 集計：毎回は書かず、期間（Config::statIntervalMs）ごとに 回数・合計・平均・最小・最大・最後 を1行で出す ----
 

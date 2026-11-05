@@ -35,14 +35,17 @@ struct OwnedSite {
     std::vector<ArgTag> tags;
 };
 
+enum class EntryKind { Record, Batch, Frame, Event };
+
 struct Entry {
     std::uint64_t order;  // 並べる時刻（時刻のない記録は、書き写した時刻）
-    std::uint64_t tick;   // Event の時刻
-    bool isEvent;
+    std::uint64_t tick;   // 時刻（0 ならなし）
+    EntryKind kind;
     std::uint32_t thread;
     const OwnedSite* site;
     std::vector<std::uint64_t> record;  // 記録のバイト列（8 バイトにそろえて持つ）
     std::string body;                   // Event の中身
+    std::uint64_t frame = 0;            // Frame の印のフレーム番号
 };
 
 Level eventLevel(std::string_view body) {
@@ -81,6 +84,7 @@ struct LogReader::State {
     std::unordered_map<std::uint64_t, std::unique_ptr<OwnedSite>> sites;
     std::unordered_map<std::uint32_t, std::string> threads;
     std::vector<Entry> entries;
+    std::uint64_t currentFrame = 0;  // 時刻の順に並べたとき、最後に通った Frame の印
 
     State(ViewFormat format_, ViewFilter filter_)
         : format(format_), filter(std::move(filter_)),
@@ -114,7 +118,7 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
         owned->site = Site{static_cast<Level>(payload.level), owned->format, owned->fileName.c_str(),
                            owned->function.c_str(), payload.line, owned->tags.data(), payload.argCount,
                            payload.sampling, payload.samplingValue};
-        sites[payload.address] = std::move(owned);
+        sites[payload.id] = std::move(owned);
         return;
     }
     case file::FrameType::ThreadDef: {
@@ -132,19 +136,23 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
             RecordHeader header;
             std::memcpy(&header, cursor, sizeof(header));
             if (header.size < sizeof(RecordHeader) || header.size > static_cast<std::size_t>(end - cursor)) {
-                // 詰め物は 8 バイトのこともあるので、頭の大きさに満たないのはここで終わり
-                break;
+                break;  // 壊れている
             }
-            if (header.kind == RecordKind::Log) {
-                auto found = sites.find(reinterpret_cast<std::uint64_t>(header.site));
-                if (found != sites.end()) {
-                    const OwnedSite* site = found->second.get();
-                    if (site->site.level >= filter.level) {
-                        Entry entry{header.tick != 0 ? header.tick : drainTick, header.tick, false, thread, site, {}, {}};
-                        entry.record.resize((header.size + 7) / 8);
-                        std::memcpy(entry.record.data(), cursor, header.size);
-                        entries.push_back(std::move(entry));
-                    }
+            // 8 バイトにそろえて写してから読む（ファイルの中の位置はそろっていない）。
+            std::vector<std::uint64_t> record((header.size + 7) / 8);
+            std::memcpy(record.data(), cursor, header.size);
+            const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(record.data()));
+            const std::uint64_t order = view.tick != 0 ? view.tick : drainTick;
+            if (header.kind == RecordKind::Frame) {
+                Entry entry{order, view.tick, EntryKind::Frame, thread, nullptr, {}, {}};
+                std::memcpy(&entry.frame, view.payload, 8);
+                entries.push_back(std::move(entry));
+            } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
+                auto found = sites.find(header.site);
+                if (found != sites.end() && found->second->site.level >= filter.level) {
+                    entries.push_back(Entry{order, view.tick,
+                                            header.kind == RecordKind::Log ? EntryKind::Record : EntryKind::Batch,
+                                            thread, found->second.get(), std::move(record), {}});
                 }
             }
             cursor += header.size;
@@ -156,7 +164,7 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
         const auto tick = read<std::uint64_t>(cursor);
         std::string body(cursor, end);
         if (eventLevel(body) < filter.level) return;
-        entries.push_back(Entry{tick, tick, true, 0, nullptr, {}, std::move(body)});
+        entries.push_back(Entry{tick, tick, EntryKind::Event, 0, nullptr, {}, std::move(body)});
         return;
     }
     }
@@ -203,7 +211,11 @@ void LogReader::take(std::string& out) {
     std::string line;
     for (const Entry& entry : s.entries) {
         line.clear();
-        if (entry.isEvent) {
+        if (entry.kind == EntryKind::Frame) {
+            s.currentFrame = entry.frame;  // ここから後の記録はこのフレーム
+            continue;
+        }
+        if (entry.kind == EntryKind::Event) {
             if (s.format == ViewFormat::Json && entry.body.find("\"event\":\"session.start\"") != std::string::npos) {
                 std::string body = entry.body;
                 body.append(",\"about\":");
@@ -217,7 +229,16 @@ void LogReader::take(std::string& out) {
             const std::string thread = name != s.threads.end() ? name->second : "T" + std::to_string(entry.thread);
             if (!s.filter.thread.empty() && thread != s.filter.thread) continue;
             const auto* header = reinterpret_cast<const RecordHeader*>(entry.record.data());
-            s.formatter.appendRecord(line, *header, entry.site->site, thread);
+            const RecordView view = viewRecord(*header);
+            if (entry.kind == EntryKind::Record) {
+                s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, entry.site->site, view.payload,
+                                         thread);
+            } else {
+                BatchInfo info;
+                std::memcpy(&info, view.payload, sizeof(info));
+                s.formatter.appendBatch(line, view.tick, s.currentFrame, entry.site->site, info,
+                                        view.payload + sizeof(info), thread, s.filter.batchRows);
+            }
         }
         if (!s.filter.contains.empty() && line.find(s.filter.contains) == std::string::npos) continue;
         out.append(line);

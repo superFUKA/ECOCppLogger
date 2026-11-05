@@ -86,6 +86,10 @@ void singleThread() {
     perCall("ECO_LOG_ON_CHANGE（100回に1回変わる）", kRounds, kBatch,
             [](int i) { ECO_LOG_ON_CHANGE(Level::Info, "bench.state2", i / 100); });
     perCall("ECO_HISTORY（最近の値を覚える＋集計）", kRounds, kBatch, [](int i) { ECO_HISTORY("bench.history", i); });
+    {
+        ECO_LOG_BATCH(batch, Level::Debug, "candidate {} value {}", int, int);
+        perCall("ECO_LOG_BATCH の add（整数2つ）", kRounds, kBatch, [&](int i) { batch.add(i, i & 1023); });
+    }
     perCall("ECO_SCOPE_TIME（区間の時間）", kRounds, kBatch, [](int i) {
         ECO_SCOPE_TIME("bench.scope");
         g_sink.fetch_add(i, std::memory_order_relaxed);
@@ -195,8 +199,22 @@ void frameScenario() {
         g_sink.fetch_add(value, std::memory_order_relaxed);
         ECO_LOG_DEBUG("candidate {} value {}", i, value);
     });
-    std::printf("  → 1フレームあたりの増え方：集計 %.3f ms、集計＋間引き %.3f ms、全部残す %.3f ms\n", stat - base,
-                sampled - base, full - base);
+    // まとめ書き：ループの外で1回だけ用意し、中では値を並べるだけ
+    eco::log::flush();
+    const auto batchStart = Clock::now();
+    for (int frame = 0; frame < kFrames; ++frame) {
+        ECO_FRAME();
+        ECO_LOG_BATCH(batch, Level::Debug, "candidate {} value {}", int, int);
+        for (int i = 0; i < kCallsPerFrame; ++i) {
+            const int value = work(i);
+            g_sink.fetch_add(value, std::memory_order_relaxed);
+            batch.add(i, value);
+        }
+    }
+    const double batched = std::chrono::duration<double, std::milli>(Clock::now() - batchStart).count() / kFrames;
+    std::printf("  %-48s %.3f ms/frame\n", "毎回 ECO_LOG_BATCH の add（全部残す）", batched);
+    std::printf("  → 1フレームあたりの増え方：集計 %.3f ms、集計＋間引き %.3f ms、全部残す %.3f ms、まとめ書きで全部残す %.3f ms\n",
+                stat - base, sampled - base, full - base, batched - base);
 }
 
 void backendThroughput() {
@@ -221,6 +239,19 @@ int main() {
     eco::log::start(benchConfig());
     std::printf("ECOCppLogger の性能測定（出力：%s）\n", eco::log::currentFile().string().c_str());
     singleThread();
+    {
+        // 時刻を残さない設定
+        eco::log::stop();
+        auto config = benchConfig();
+        config.recordTime = false;
+        eco::log::start(config);
+        std::printf("\n[1b] 時刻を残さない設定（Config::recordTime = false）\n");
+        perCall("ECO_LOG_INFO 整数2つ＋小数2つ", 5, 100000, [](int i) {
+            ECO_LOG_INFO("player {} hp={} pos=({}, {})", i, 100 - i % 100, i * 0.5, i * 0.25);
+        });
+        eco::log::stop();
+        eco::log::start(benchConfig());
+    }
     latency();
     multiThread();
     frameScenario();

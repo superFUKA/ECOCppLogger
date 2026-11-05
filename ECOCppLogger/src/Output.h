@@ -57,8 +57,13 @@ public:
     }
     const TimeBase& timeBase() const noexcept { return timeBase_; }
 
-    // 記録1件（tick が 0 なら時刻を記録しない設定）→ 1行（改行つき）。
-    void appendRecord(std::string& out, const RecordHeader& header, const Site& site, std::string_view thread);
+    // 記録1件（tick が 0 なら時刻を記録しない設定、frame が 0 ならフレームなし）→ 1行（改行つき）。
+    void appendRecord(std::string& out, std::uint64_t tick, std::uint64_t frame, std::uint64_t aux, const Site& site,
+                      const std::byte* arguments, std::string_view thread);
+
+    // まとめ書きの塊 → JSON は1行（rows に1件ずつの値）、文章は頭の行＋1件ずつの行（maxRows まで。0 なら全部）。
+    void appendBatch(std::string& out, std::uint64_t tick, std::uint64_t frame, const Site& site, const BatchInfo& info,
+                     const std::byte* elements, std::string_view thread, std::size_t maxRows);
 
     // めったにないもの（集計・最近の値 等）。body は "t" を除く JSON の中身。
     void appendEvent(std::string& out, std::uint64_t tick, std::string_view body);

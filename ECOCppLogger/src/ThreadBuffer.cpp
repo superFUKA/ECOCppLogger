@@ -109,6 +109,37 @@ std::uint32_t Registry::registerStat(StatSite& site) noexcept {
     return expected;
 }
 
+std::uint32_t Registry::registerSite(const Site& site, SiteIdSlot& slot) noexcept {
+    std::lock_guard lock(siteMutex_);
+    std::uint32_t id = slot.load(std::memory_order_acquire);
+    if (id != 0) {
+        return id;  // ほかのスレッドが先に振った
+    }
+    id = nextSiteId_;
+    const std::size_t chunkIndex = id / kSiteChunkSize;
+    if (chunkIndex >= kSiteChunks) {
+        return 0;  // 多すぎる：このログは書かない
+    }
+    std::atomic<const Site*>* chunk = siteChunks_[chunkIndex].load(std::memory_order_relaxed);
+    if (!chunk) {
+        chunk = new std::atomic<const Site*>[kSiteChunkSize]();
+        siteChunks_[chunkIndex].store(chunk, std::memory_order_release);
+    }
+    chunk[id % kSiteChunkSize].store(&site, std::memory_order_release);
+    ++nextSiteId_;
+    slot.store(id, std::memory_order_release);
+    return id;
+}
+
+const Site* Registry::siteById(std::uint32_t id) const noexcept {
+    const std::size_t chunkIndex = id / kSiteChunkSize;
+    if (chunkIndex >= kSiteChunks) {
+        return nullptr;
+    }
+    const std::atomic<const Site*>* chunk = siteChunks_[chunkIndex].load(std::memory_order_acquire);
+    return chunk ? chunk[id % kSiteChunkSize].load(std::memory_order_acquire) : nullptr;
+}
+
 namespace detail {
 
 HistoryRing* createHistory(StatSlot& slot, const StatSite& site) {

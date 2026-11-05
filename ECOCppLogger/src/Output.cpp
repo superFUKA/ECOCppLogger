@@ -1,5 +1,6 @@
 #include "Output.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -336,20 +337,20 @@ void LineFormatter::appendTime(std::string& out, std::uint64_t tick) {
     out.append(cachedSuffix_);
 }
 
-void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, const Site& site,
-                                 std::string_view thread) {
+void LineFormatter::appendRecord(std::string& out, std::uint64_t tick, std::uint64_t frame, std::uint64_t aux,
+                                 const Site& site, const std::byte* arguments, std::string_view thread) {
     message_.clear();
-    renderMessage(message_, site, reinterpret_cast<const std::byte*>(&header) + sizeof(RecordHeader));
+    renderMessage(message_, site, arguments);
     source_.assign(sourceFileName(site.file, fullPath_));
     source_.push_back(':');
     appendUnsigned(source_, site.line);
     const auto sampling = static_cast<Sampling>(site.sampling);
 
     if (format_ == OutputFormat::Text) {
-        appendTime(out, header.tick);
-        if (header.frame != 0) {
+        appendTime(out, tick);
+        if (frame != 0) {
             out.append(" f");
-            appendUnsigned(out, header.frame);
+            appendUnsigned(out, frame);
         }
         out.push_back(' ');
         out.append(levelColumn(levelName(site.level)));
@@ -367,14 +368,14 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, c
             out.append(sampling == Sampling::EveryN ? "  (every " : "  (first ");
             appendUnsigned(out, site.samplingValue);
             out.append(", #");
-            appendUnsigned(out, header.aux);
+            appendUnsigned(out, aux);
             out.push_back(')');
             break;
         case Sampling::EveryMs:
             out.append("  (every ");
             appendUnsigned(out, site.samplingValue);
             out.append("ms, skipped ");
-            appendUnsigned(out, header.aux);
+            appendUnsigned(out, aux);
             out.push_back(')');
             break;
         case Sampling::OnChange:
@@ -386,11 +387,11 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, c
 
     out.push_back('{');
     const std::size_t start = out.size();
-    appendTime(out, header.tick);
-    if (header.frame != 0) {
+    appendTime(out, tick);
+    if (frame != 0) {
         if (out.size() != start) out.push_back(',');
         out.append("\"f\":");
-        appendUnsigned(out, header.frame);
+        appendUnsigned(out, frame);
     }
     if (out.size() != start) out.push_back(',');
     out.append("\"lv\":\"");
@@ -409,21 +410,132 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, c
         out.append(sampling == Sampling::EveryN ? ",\"sample\":\"every " : ",\"sample\":\"first ");
         appendUnsigned(out, site.samplingValue);
         out.append("\",\"n\":");
-        appendUnsigned(out, header.aux);
+        appendUnsigned(out, aux);
         break;
     case Sampling::EveryMs:
         out.append(",\"sample\":\"every ");
         appendUnsigned(out, site.samplingValue);
         out.append("ms\",\"skipped\":");
-        appendUnsigned(out, header.aux);
+        appendUnsigned(out, aux);
         break;
     case Sampling::OnChange:
         out.append(",\"sample\":\"on change\",\"change\":");
-        appendUnsigned(out, header.aux);
+        appendUnsigned(out, aux);
         break;
     case Sampling::None: break;
     }
     out.append("}\n");
+}
+
+void LineFormatter::appendBatch(std::string& out, std::uint64_t tick, std::uint64_t frame, const Site& site,
+                                const BatchInfo& info, const std::byte* elements, std::string_view thread,
+                                std::size_t maxRows) {
+    source_.assign(sourceFileName(site.file, fullPath_));
+    source_.push_back(':');
+    appendUnsigned(source_, site.line);
+    const double durationUs =
+        tick != 0 && info.endTick > tick
+            ? static_cast<double>(info.endTick - tick) / timeBase_.ticksPerNanosecond / 1000.0
+            : 0.0;
+
+    if (format_ == OutputFormat::Text) {
+        appendTime(out, tick);
+        if (frame != 0) {
+            out.append(" f");
+            appendUnsigned(out, frame);
+        }
+        out.push_back(' ');
+        out.append(levelColumn(levelName(site.level)));
+        out.append(" [");
+        out.append(thread);
+        out.append("] ");
+        out.append(source_);
+        out.push_back(' ');
+        out.append(shortFunctionName(site.function));
+        out.append(": batch ");
+        appendUnsigned(out, info.count);
+        if (tick != 0) {
+            out.append(" in ");
+            appendDouble(out, std::round(durationUs * 10.0) / 10.0);
+            out.append("us");
+        }
+        out.append(": ");
+        out.append(site.format);
+        out.push_back('\n');
+        const std::size_t rows = maxRows == 0 ? info.count : std::min<std::size_t>(maxRows, info.count);
+        for (std::size_t i = 0; i < rows; ++i) {
+            out.append("    #");
+            appendUnsigned(out, i);
+            out.push_back(' ');
+            renderMessage(out, site, elements + i * info.elementSize);
+            out.push_back('\n');
+        }
+        if (rows < info.count) {
+            out.append("    … ");
+            appendUnsigned(out, info.count - rows);
+            out.append(" more\n");
+        }
+        return;
+    }
+
+    out.push_back('{');
+    const std::size_t start = out.size();
+    appendTime(out, tick);
+    if (frame != 0) {
+        if (out.size() != start) out.push_back(',');
+        out.append("\"f\":");
+        appendUnsigned(out, frame);
+    }
+    if (out.size() != start) out.push_back(',');
+    out.append("\"lv\":\"");
+    out.append(levelName(site.level));
+    out.append("\",\"th\":");
+    appendJsonString(out, thread);
+    out.append(",\"src\":");
+    appendJsonString(out, source_);
+    out.append(",\"fn\":");
+    appendJsonString(out, shortFunctionName(site.function));
+    out.append(",\"msg\":");
+    appendJsonString(out, site.format);
+    out.append(",\"batch\":");
+    appendUnsigned(out, info.count);
+    if (tick != 0) {
+        out.append(",\"duration_us\":");
+        appendDouble(out, std::round(durationUs * 1000.0) / 1000.0);
+    }
+    // 1件ずつの値（書式の {} の順）。文字列は使えないので、数値・真偽・文字・アドレス。
+    out.append(",\"rows\":[");
+    for (std::uint32_t i = 0; i < info.count; ++i) {
+        if (i > 0) out.push_back(',');
+        out.push_back('[');
+        const std::byte* cursor = elements + static_cast<std::size_t>(i) * info.elementSize;
+        for (std::uint8_t a = 0; a < site.argCount; ++a) {
+            if (a > 0) out.push_back(',');
+            switch (site.tags[a]) {
+            case ArgTag::Bool: out.append(readValue<bool>(cursor) ? "true" : "false"); break;
+            case ArgTag::Char: {
+                const char c = readValue<char>(cursor);
+                appendJsonString(out, std::string_view(&c, 1));
+                break;
+            }
+            case ArgTag::Int: appendSigned(out, readValue<std::int64_t>(cursor)); break;
+            case ArgTag::UInt: appendUnsigned(out, readValue<std::uint64_t>(cursor)); break;
+            case ArgTag::Double: appendDouble(out, readValue<double>(cursor)); break;
+            case ArgTag::Pointer: {
+                const auto address = readValue<std::uint64_t>(cursor);
+                char buffer[24] = {'"', '0', 'x'};
+                auto result = std::to_chars(buffer + 3, buffer + sizeof(buffer) - 1, address, 16);
+                *result.ptr++ = '"';
+                out.append(buffer, result.ptr);
+                break;
+            }
+            case ArgTag::String:
+            case ArgTag::None: out.append("null"); break;
+            }
+        }
+        out.push_back(']');
+    }
+    out.append("]}\n");
 }
 
 void LineFormatter::appendEvent(std::string& out, std::uint64_t tick, std::string_view body) {

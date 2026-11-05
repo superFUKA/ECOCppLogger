@@ -9,7 +9,7 @@
 //   フレーム = FrameHeader（種類・中身の大きさ） + 中身
 //
 //   Clock    ：時刻の換算（ticks → UNIX 時刻）。始めと、集計のたび・落ちたときに書く（最後のものが一番正確）
-//   SiteDef  ：呼び出し位置（Site のアドレス → 書式・ファイル・行・関数・引数の型）。ファイルで初めて出たときに書く
+//   SiteDef  ：呼び出し位置（番号 → 書式・ファイル・行・関数・引数の型）。ファイルで初めて出たときに書く
 //   ThreadDef：スレッドの番号 → 名前
 //   Block    ：あるスレッドのリングバッファの中身（RecordHeader＋引数 の並び。詰め物を含むことがある）そのまま
 //   Event    ：めったにないもの（集計・最近の値・捨てた数・落ちた・始め・終わり）。時刻＋JSON の中身（"t" を除く）
@@ -19,7 +19,7 @@
 namespace eco::log::detail::file {
 
 inline constexpr char kMagic[8] = {'E', 'C', 'O', 'L', 'O', 'G', '\0', '\1'};
-inline constexpr std::uint32_t kVersion = 1;
+inline constexpr std::uint32_t kVersion = 2;  // 2：記録の頭を 8 バイトに（RecordHeader）、まとめ書き・フレームの印
 
 enum class FrameType : std::uint32_t {
     Clock = 1,
@@ -44,7 +44,7 @@ struct ClockPayload {
 
 // SiteDef の中身：SiteDefPayload、引数の型（argCount バイト）、書式・ファイル・関数（それぞれ uint32 の長さ＋バイト列）
 struct SiteDefPayload {
-    std::uint64_t address;
+    std::uint64_t id;  // 記録の頭の site（呼び出し位置の番号）
     std::uint64_t samplingValue;
     std::uint32_t line;
     std::uint8_t level;

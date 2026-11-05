@@ -31,7 +31,7 @@ enum class ArgTag : std::uint8_t {
 // 1つの文字列引数で残す最大のバイト数（超えた分は捨て、"…" を付ける）。
 inline constexpr std::size_t kMaxStringBytes = 4096;
 
-// 呼び出し位置ごとの静的な情報（マクロの中で static constexpr に作る。実行時の登録は要らない）。
+// 呼び出し位置ごとの静的な情報（マクロの中で static constexpr に作る）。
 struct Site {
     Level level;
     std::string_view format;
@@ -73,21 +73,63 @@ struct StatSite {
         : name(name_), file(file_), line(line_), kind(kind_), historyCapacity(historyCapacity_) {}
 };
 
-enum class RecordKind : std::uint32_t {
+// 呼び出し位置の番号の置き場所。Site は static constexpr（書き換えられない）なので、番号は隣の
+// static constinit に持ち、最初に使われたときに振る（以後は load 1回と、ほぼ必ず外れる分岐1つ）。0 はまだ振っていない。
+using SiteIdSlot = std::atomic<std::uint32_t>;
+
+enum class RecordKind : std::uint8_t {
     Padding,  // リングバッファの終わりを飛ばすための詰め物
-    Log,
+    Log,      // 1件のログ：頭［＋時刻］［＋間引きの情報］＋引数
+    Frame,    // ECO_FRAME の印：頭［＋時刻］＋フレーム番号（uint64）。ここから後の記録はこのフレーム
+    Batch,    // まとめ書き（ECO_LOG_BATCH）：頭［＋時刻］＋BatchInfo＋引数の並び（件数ぶん、頭なし）
 };
 
-// リングバッファの1件の頭。大きさ（頭を含む）は 8 の倍数。
-struct RecordHeader {
-    std::uint32_t size;
-    RecordKind kind;
-    std::uint64_t tick;
-    std::uint64_t frame;
-    const Site* site;
-    std::uint64_t aux;  // 間引きの情報（Sampling を参照）
+enum RecordFlags : std::uint8_t {
+    kRecordHasTick = 1,  // 頭の後に uint64 の時刻（Config::recordTime）
+    kRecordHasAux = 2,   // その後に uint64 の間引きの情報（Sampling を参照。間引くログだけ）
 };
-static_assert(sizeof(RecordHeader) == 40);
+
+// リングバッファの1件の頭（8 バイト）。1件の大きさ（頭を含む）は 8 の倍数で、65528 バイトまで。
+// 以前の形（40 バイト：大きさ4・種類4・時刻8・フレーム番号8・Site のアドレス8・間引き8）から、
+// 大きさを2、種類・印を1ずつ、呼び出し位置を4バイトの番号にし、時刻・間引きは要るときだけ後ろに付ける。
+struct RecordHeader {
+    std::uint16_t size;
+    RecordKind kind;
+    std::uint8_t flags;  // RecordFlags
+    std::uint32_t site;  // 呼び出し位置の番号（1 から。Padding・Frame は 0）
+};
+static_assert(sizeof(RecordHeader) == 8);
+
+inline constexpr std::size_t kMaxRecordBytes = 65528;
+
+// まとめ書きの塊の情報（Batch の時刻の後）。
+struct BatchInfo {
+    std::uint32_t count;        // 件数
+    std::uint32_t elementSize;  // 1件の引数のバイト数（引数はすべて決まった大きさ）
+    std::uint64_t endTick;      // 最後の1件の後の時刻（時刻を残さない設定なら 0）
+};
+
+// 頭の後ろの部分（時刻・間引き・中身）を読む位置。
+struct RecordView {
+    std::uint64_t tick = 0;  // 0 なら時刻なし
+    std::uint64_t aux = 0;
+    const std::byte* payload = nullptr;
+};
+
+inline RecordView viewRecord(const RecordHeader& header) noexcept {
+    RecordView view;
+    const auto* cursor = reinterpret_cast<const std::byte*>(&header) + sizeof(RecordHeader);
+    if (header.flags & kRecordHasTick) {
+        std::memcpy(&view.tick, cursor, 8);
+        cursor += 8;
+    }
+    if (header.flags & kRecordHasAux) {
+        std::memcpy(&view.aux, cursor, 8);
+        cursor += 8;
+    }
+    view.payload = cursor;
+    return view;
+}
 
 namespace detail {
 
@@ -159,6 +201,17 @@ struct TagList {
 
 template <class... Args>
 TagList<tagOfNormalized<Normalized<Args>>()...> tagList(const Args&...);
+
+// まとめ書きの型の並び（ECO_LOG_BATCH に書いた型）→ ArgTag の配列。
+template <class... Types>
+using BatchTags = TagList<tagOfNormalized<Normalized<Types>>()...>;
+
+// 決まった大きさで書ける型か（文字列以外）と、その大きさ。
+template <class N>
+constexpr std::size_t fixedEncodedSize() noexcept {
+    if constexpr (std::is_same_v<N, bool> || std::is_same_v<N, char>) return 1;
+    else return 8;
+}
 
 // ---- 書式の確認：{} の数をコンパイル時に数える（{{ と }} は文字そのもの） ------------------------------
 

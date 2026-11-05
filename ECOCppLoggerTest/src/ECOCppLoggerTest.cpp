@@ -179,6 +179,68 @@ TEST(ECOCppLogger, HistoryKeepsRecentValuesUntilDumped) {
     EXPECT_EQ(values, (std::vector<int>{993, 994, 995, 996, 997, 998, 999, 1000})) << *line;
 }
 
+TEST(ECOCppLogger, BatchWritesValuesUnderOneHeader) {
+    Session session;
+    {
+        ECO_LOG_BATCH(batch, Level::Debug, "i={} d={} hit={}", int, double, bool);
+        for (int i = 0; i < 10; ++i) {
+            batch.add(i, i * 0.5, i % 3 == 0);
+        }
+    }  // スコープの終わりで書く
+    const auto lines = session.lines();
+    const std::string* line = findContaining(lines, "\"batch\":10");
+    ASSERT_NE(line, nullptr);
+    EXPECT_NE(line->find("\"msg\":\"i={} d={} hit={}\""), std::string::npos) << *line;
+    EXPECT_NE(line->find("\"rows\":[[0,0,true],[1,0.5,false],[2,1,false],[3,1.5,true]"), std::string::npos) << *line;
+    EXPECT_NE(line->find("\"duration_us\":"), std::string::npos) << *line;
+
+    const auto text = eco::log::test::readLines(eco::log::currentFile(), eco::log::ViewFormat::Text);
+    EXPECT_EQ(countContaining(text, ": batch 10 in "), 1u);
+    EXPECT_EQ(countContaining(text, "    #3 i=3 d=1.5 hit=true"), 1u);
+}
+
+TEST(ECOCppLogger, BatchSplitsLargeLoopsAndKeepsOrder) {
+    Session session;
+    constexpr int kCount = 100000;
+    {
+        ECO_LOG_BATCH(batch, Level::Debug, "v={}", int);
+        for (int i = 0; i < kCount; ++i) {
+            batch.add(i);
+            if (i == kCount / 2) {
+                ECO_LOG_INFO("in the middle");  // まとめ書きの途中に普通のログを挟んでもよい
+            }
+        }
+    }
+    const auto lines = session.lines();
+    int next = 0;
+    std::size_t batches = 0;
+    for (const auto& line : lines) {
+        const auto rows = line.find("\"rows\":[");
+        if (rows == std::string::npos) continue;
+        ++batches;
+        for (std::size_t at = line.find('[', rows + 8); at != std::string::npos; at = line.find('[', at + 1)) {
+            ASSERT_EQ(std::stoi(line.substr(at + 1)), next) << "まとめ書きの順番が崩れた";
+            ++next;
+        }
+    }
+    EXPECT_EQ(next, kCount);
+    EXPECT_GT(batches, 1u);  // 一杯になるたびに分かれる
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"in the middle\""), 1u);
+}
+
+TEST(ECOCppLogger, BatchDoesNothingBelowTheLevel) {
+    Session session;
+    eco::log::setLevel(Level::Warn);
+    {
+        ECO_LOG_BATCH(batch, Level::Debug, "v={}", int);
+        EXPECT_FALSE(batch.enabled());
+        for (int i = 0; i < 1000; ++i) {
+            batch.add(i);
+        }
+    }
+    EXPECT_EQ(countContaining(session.lines(), "\"batch\":"), 0u);
+}
+
 TEST(ECOCppLogger, AggregatesStats) {
     Session session;
     for (int i = 1; i <= 100; ++i) {

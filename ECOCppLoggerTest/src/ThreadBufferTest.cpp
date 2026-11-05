@@ -12,15 +12,21 @@ using eco::log::ThreadBuffer;
 
 namespace {
 
+// 頭（8）＋値（8）の記録を size バイトで書く。
 bool writeRecord(ThreadBuffer& buffer, std::uint64_t value, std::size_t size) {
     std::byte* out = buffer.reserve(size);
     if (!out) {
         return false;
     }
-    RecordHeader header{static_cast<std::uint32_t>(size), RecordKind::Log, value, 0, nullptr, value};
+    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Log, eco::log::kRecordHasTick, 1};
     std::memcpy(out, &header, sizeof(header));
+    std::memcpy(out + sizeof(header), &value, 8);
     buffer.commit();
     return true;
+}
+
+std::uint64_t valueOf(const RecordHeader& header) {
+    return eco::log::viewRecord(header).tick;
 }
 
 }  // namespace
@@ -58,7 +64,7 @@ TEST(ThreadBuffer, WrapsAroundKeepingOrder) {
             ++next;
         }
         buffer.consume([&](const RecordHeader& header) {
-            EXPECT_EQ(header.aux, expected);
+            EXPECT_EQ(valueOf(header), expected);
             ++expected;
         });
     }
@@ -79,7 +85,7 @@ TEST(ThreadBuffer, ProducerAndConsumerOnDifferentThreads) {
     std::uint64_t expected = 0;
     while (expected < kCount) {
         buffer.consume([&](const RecordHeader& header) {
-            ASSERT_EQ(header.aux, expected);
+            ASSERT_EQ(valueOf(header), expected);
             ++expected;
         });
     }

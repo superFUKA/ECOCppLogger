@@ -148,7 +148,7 @@ private:
     void writeOut();
     void appendFrame(file::FrameType type, std::initializer_list<std::pair<const void*, std::size_t>> parts);
     void writeClock();
-    void writeSiteDef(const Site& site);
+    void writeSiteDef(std::uint32_t id, const Site& site);
     void writeEvent(std::uint64_t tick, std::string_view body);
     void writeConsole(const RecordHeader& header, std::string_view thread);
 
@@ -165,9 +165,9 @@ private:
     std::string out_;
     std::string event_;
 
-    // このファイルに書いた呼び出し位置・スレッドの名前（ファイルを替えたら書き直す）
-    std::unordered_set<const Site*> knownSites_;
-    const Site* lastSite_ = nullptr;
+    // このファイルに書いた呼び出し位置（番号ごと）・スレッドの名前（ファイルを替えたら書き直す）
+    std::vector<bool> knownSites_;
+    std::uint32_t lastSite_ = 0;
     std::unordered_map<std::uint32_t, std::string> knownThreads_;
 
     std::mutex dumpMutex_;
@@ -217,8 +217,8 @@ void Backend::writeClock() {
     appendFrame(file::FrameType::Clock, {{&payload, sizeof(payload)}});
 }
 
-void Backend::writeSiteDef(const Site& site) {
-    const file::SiteDefPayload payload{reinterpret_cast<std::uint64_t>(&site), site.samplingValue, site.line,
+void Backend::writeSiteDef(std::uint32_t id, const Site& site) {
+    const file::SiteDefPayload payload{id, site.samplingValue, site.line,
                                        static_cast<std::uint8_t>(site.level), site.sampling, site.argCount, 0};
     const std::string_view fileName = site.file;
     const std::string_view function = site.function;
@@ -234,7 +234,10 @@ void Backend::writeSiteDef(const Site& site) {
                  {fileName.data(), fileLength},
                  {&functionLength, 4},
                  {function.data(), functionLength}});
-    knownSites_.insert(&site);
+    if (knownSites_.size() <= id) {
+        knownSites_.resize(id + 1024, false);
+    }
+    knownSites_[id] = true;
 }
 
 void Backend::writeEvent(std::uint64_t tick, std::string_view body) {
@@ -267,7 +270,7 @@ bool Backend::openFile() {
     }
     // ファイルごとに読めるように、頭・時刻の換算・始めの Event を書き、呼び出し位置・スレッドは書き直す。
     knownSites_.clear();
-    lastSite_ = nullptr;
+    lastSite_ = 0;
     knownThreads_.clear();
     out_.append(file::kMagic, sizeof(file::kMagic));
     out_.append(reinterpret_cast<const char*>(&file::kVersion), sizeof(file::kVersion));
@@ -435,10 +438,15 @@ void Backend::run() {
 }
 
 void Backend::writeConsole(const RecordHeader& header, std::string_view thread) {
+    const Site* site = Registry::instance().siteById(header.site);
+    if (!site || site->level < config_.consoleLevel) {
+        return;
+    }
     std::string line;
     console_->setTimeBase({clock_->baseTick(), clock_->baseUnixNanoseconds(), clock_->ticksPerNanosecond(),
                            detail::localUtcOffsetMinutes()});
-    console_->appendRecord(line, header, *header.site, thread);
+    const RecordView view = viewRecord(header);
+    console_->appendRecord(line, view.tick, 0, view.aux, *site, view.payload, thread);
     std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
@@ -458,20 +466,19 @@ void Backend::drain(bool emergency) {
         buffer->consumeSpans([&](const std::byte* data, std::size_t length) {
             // 初めての呼び出し位置だけ SiteDef を先に書く（ほかは記録の頭を見るだけ）。
             for (std::size_t offset = 0; offset < length;) {
-                // 詰め物は 8 バイトしかないことがあるので、まず大きさと種類だけ読む。
-                RecordHeader header;
-                std::memcpy(&header, data + offset, 8);
-                if (header.kind == RecordKind::Log) {
-                    std::memcpy(&header, data + offset, sizeof(header));
+                const auto& header = *reinterpret_cast<const RecordHeader*>(data + offset);
+                if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
                     if (header.site != lastSite_) {
-                        if (!knownSites_.contains(header.site)) {
-                            writeSiteDef(*header.site);
+                        if (header.site >= knownSites_.size() || !knownSites_[header.site]) {
+                            if (const Site* site = Registry::instance().siteById(header.site)) {
+                                writeSiteDef(header.site, *site);
+                            }
                         }
                         lastSite_ = header.site;
                     }
                     ++records_;
-                    if (console_ && header.site->level >= config_.consoleLevel) {
-                        writeConsole(*reinterpret_cast<const RecordHeader*>(data + offset), entry.name);
+                    if (console_ && header.kind == RecordKind::Log) {
+                        writeConsole(header, entry.name);
                     }
                 }
                 offset += header.size;
@@ -762,7 +769,30 @@ void setThreadName(std::string_view name) {
 }
 
 void nextFrame() noexcept {
-    detail::g_frame.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t frame = detail::g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!detail::g_recordFrame.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // 1件ごとにフレーム番号を持たせる代わりに、「ここからフレームN」という印を1件書く（読む側が後の記録に当てる）。
+    ThreadBuffer* buffer = detail::threadBuffer();
+    const bool withTime = detail::recordTime();
+    const std::size_t size = sizeof(RecordHeader) + (withTime ? 8 : 0) + 8;
+    std::byte* out = buffer->reserve(size);
+    if (!out) {
+        buffer->countDrop();
+        return;
+    }
+    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Frame,
+                              static_cast<std::uint8_t>(withTime ? kRecordHasTick : 0), 0};
+    std::memcpy(out, &header, sizeof(header));
+    std::byte* cursor = out + sizeof(header);
+    if (withTime) {
+        const std::uint64_t tick = ticks();
+        std::memcpy(cursor, &tick, 8);
+        cursor += 8;
+    }
+    std::memcpy(cursor, &frame, 8);
+    buffer->commit();
 }
 
 std::uint64_t frame() noexcept {

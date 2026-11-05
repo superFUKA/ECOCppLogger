@@ -18,9 +18,7 @@
     "name": "ECOCppLogger",
     "projects": {
       "ECOCppLogger": "../../ECOCppLogger",
-      "ECOCppLoggerBench": "../../ECOCppLoggerBench",
-      "ECOCppLoggerTest": "../../ECOCppLoggerTest",
-      "ECOCppLoggerView": "../../ECOCppLoggerView"
+      "ECOCppLoggerTest": "../../ECOCppLoggerTest"
     },
     "references": {},
     "solution_folders": {

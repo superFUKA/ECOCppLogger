@@ -193,10 +193,26 @@ int localUtcOffsetMinutes() {
 LineFormatter::LineFormatter(const Clock& clock, bool fullPath)
     : clock_(clock), fullPath_(fullPath), utcOffsetMinutes_(localUtcOffsetMinutes()) {}
 
-void LineFormatter::appendLineStart(std::string& out, std::uint64_t tick) const {
-    out.append("{\"t\":\"");
-    appendTimestamp(out, clock_.toUnixNanoseconds(tick), utcOffsetMinutes_);
-    out.push_back('"');
+void LineFormatter::appendLineStart(std::string& out, std::uint64_t tick) {
+    // 秒までの部分は、同じ秒の間は使い回す（毎行の年月日の計算をなくす）。
+    const std::int64_t unixNanoseconds = clock_.toUnixNanoseconds(tick);
+    std::int64_t second = unixNanoseconds / 1'000'000'000LL;
+    std::int64_t nanoseconds = unixNanoseconds % 1'000'000'000LL;
+    if (nanoseconds < 0) {
+        nanoseconds += 1'000'000'000LL;
+        --second;
+    }
+    if (second != cachedSecond_ || cachedPrefix_.empty()) {
+        std::string full;
+        appendTimestamp(full, second * 1'000'000'000LL, utcOffsetMinutes_);
+        const std::size_t dot = full.find('.');
+        cachedPrefix_ = "{\"t\":\"" + full.substr(0, dot + 1);
+        cachedSuffix_ = full.substr(dot + 7) + "\"";
+        cachedSecond_ = second;
+    }
+    out.append(cachedPrefix_);
+    appendPadded(out, static_cast<unsigned>(nanoseconds / 1000), 6);
+    out.append(cachedSuffix_);
 }
 
 void LineFormatter::renderMessage(const RecordHeader& header) {
@@ -257,14 +273,19 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, s
     out.append(levelName(site.level));
     out.append("\",\"th\":");
     appendJsonString(out, threadName);
-    out.append(",\"src\":");
-    source_.assign(sourceFileName(site.file, fullPath_));  // フルパスの \ はエスケープが要る
-    source_.push_back(':');
-    appendUnsigned(source_, site.line);
-    appendJsonString(out, source_);
-    out.append(",\"fn\":");
-    appendJsonString(out, shortFunctionName(site.function));
-    out.append(",\"msg\":");
+    // 呼び出し位置ごとに変わらない部分（src・fn）は、最初の1回だけ作って使い回す。
+    auto [entry, inserted] = siteCache_.try_emplace(&site);
+    if (inserted) {
+        std::string source(sourceFileName(site.file, fullPath_));  // フルパスの \ はエスケープが要る
+        source.push_back(':');
+        appendUnsigned(source, site.line);
+        entry->second.append(",\"src\":");
+        appendJsonString(entry->second, source);
+        entry->second.append(",\"fn\":");
+        appendJsonString(entry->second, shortFunctionName(site.function));
+        entry->second.append(",\"msg\":");
+    }
+    out.append(entry->second);
     appendJsonString(out, message_);
     switch (static_cast<Sampling>(site.sampling)) {
     case Sampling::EveryN:

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "ECOCppLogger/Clock.h"
 #include "ECOCppLogger/Record.h"
@@ -38,7 +39,7 @@ public:
     std::string_view lastMessage() const noexcept { return message_; }
 
     // 記録と同じ形の "t" で始まる行の頭："{\"t\":\"…\""
-    void appendLineStart(std::string& out, std::uint64_t tick) const;
+    void appendLineStart(std::string& out, std::uint64_t tick);
 
     const Clock& clock() const noexcept { return clock_; }
     bool fullPath() const noexcept { return fullPath_; }
@@ -50,7 +51,10 @@ private:
     bool fullPath_;
     int utcOffsetMinutes_;
     std::string message_;
-    std::string source_;
+    std::unordered_map<const Site*, std::string> siteCache_;
+    std::int64_t cachedSecond_ = 0;
+    std::string cachedPrefix_;
+    std::string cachedSuffix_;
 };
 
 }  // namespace eco::log::detail

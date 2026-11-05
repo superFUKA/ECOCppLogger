@@ -73,14 +73,14 @@
 
 // ---- 間引き：毎フレーム何万回も通る所向け（出力に "sample" と何回目か・省いた数が付く） ----------------------
 
-// n 回に1回（1回目・n+1回目 …）。n は定数。
+// n 回に1回（スレッドごとに数える：1回目・n+1回目 …）。n は定数。
+// 共有の atomic で数えると、毎回スレッド間でキャッシュラインを取り合う（測定で約 6ns → 約 1ns）。
 #define ECO_LOG_EVERY_N(lvl_, n_, fmt_, ...)                                                            \
     do {                                                                                                \
         if constexpr (static_cast<int>(lvl_) >= ECO_LOG_COMPILE_LEVEL) {                                \
             if (::eco::log::detail::isEnabled(lvl_)) {                                                  \
-                static ::std::atomic<::std::uint64_t> eco_log_counter_{0};                              \
-                const ::std::uint64_t eco_log_n_ =                                                      \
-                    eco_log_counter_.fetch_add(1, ::std::memory_order_relaxed);                         \
+                static thread_local ::std::uint64_t eco_log_counter_ = 0;                               \
+                const ::std::uint64_t eco_log_n_ = eco_log_counter_++;                                  \
                 if (eco_log_n_ % static_cast<::std::uint64_t>(n_) == 0) {                               \
                     using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));           \
                     ECO_LOG_DEFINE_SITE_(lvl_, ::eco::log::Sampling::EveryN, n_, fmt_);                 \

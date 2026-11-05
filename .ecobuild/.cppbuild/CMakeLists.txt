@@ -121,6 +121,15 @@ if(CPPBUILD_WHOLE_SOLUTION OR DEFINED CPPBUILD_REQUEST_ec41152aa7e64c4db61861a7f
   add_subdirectory("projects/ECOCppLogger" "ECOCppLogger")
 endif()
 
+# ECOCppLoggerBench: executable, GUID caed90fb-5f79-4600-b711-926c60c43b0e
+if(CPPBUILD_WHOLE_SOLUTION OR DEFINED CPPBUILD_REQUEST_caed90fb5f794600b711926c60c43b0e)
+  set(CPPBUILD_REQUESTED ${CPPBUILD_REQUEST_caed90fb5f794600b711926c60c43b0e})
+  if(CPPBUILD_WHOLE_SOLUTION)
+    set(CMAKE_FOLDER "Projects")
+  endif()
+  add_subdirectory("projects/ECOCppLoggerBench" "ECOCppLoggerBench")
+endif()
+
 # ECOCppLoggerTest: test, GUID 6cb304bb-c2b5-45e2-afb5-9b5c975f803e
 if(BUILD_TESTING AND (CPPBUILD_WHOLE_SOLUTION OR DEFINED CPPBUILD_REQUEST_6cb304bbc2b545e2afb59b5c975f803e))
   set(CPPBUILD_REQUESTED ${CPPBUILD_REQUEST_6cb304bbc2b545e2afb59b5c975f803e})
@@ -138,7 +147,7 @@ endif()
 # Visual Studio starts the first program that exists (a TEST only with BUILD_TESTING);
 # without it, F5 would start ALL_BUILD, the first project of the .sln.
 if(CPPBUILD_WHOLE_SOLUTION)
-  foreach(_cppbuild_startup IN ITEMS ECOCppLoggerTest)
+  foreach(_cppbuild_startup IN ITEMS ECOCppLoggerBench ECOCppLoggerTest)
     if(TARGET ${_cppbuild_startup})
       set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${_cppbuild_startup})
       break()

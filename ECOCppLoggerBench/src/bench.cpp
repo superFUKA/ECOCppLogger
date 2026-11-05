@@ -1,0 +1,241 @@
+// ECOCppLogger の性能測定。Release で実行する：
+//   ecobuild run ECOCppLoggerBench --configuration Release
+//
+// 測るもの
+//   1. 呼び出し1回のコスト（記録する側のスレッドの時間。整形・書き出しは裏のスレッド）
+//   2. 呼び出し1回の時間のばらつき（p50・p99・p99.9・最大）
+//   3. 複数のスレッドから同時に書いたときの量と、捨てた数
+//   4. 毎フレーム 5 万回通る処理に、集計・間引きを入れたときの1フレームあたりの増え方
+//   5. 裏のスレッドの書き出しの速さ（1秒あたりの行数）
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "ECOCppLogger/ECOCppLogger.h"
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+using eco::log::Level;
+
+std::atomic<std::uint64_t> g_sink{0};  // 最適化で消されないように
+
+std::filesystem::path benchDirectory() {
+    return std::filesystem::temp_directory_path() / "ECOCppLoggerBench";
+}
+
+eco::log::Config benchConfig() {
+    eco::log::Config config;
+    config.directory = benchDirectory();
+    config.consoleLevel = Level::Off;
+    config.threadBufferBytes = std::size_t{64} << 20;
+    config.maxFileBytes = std::uint64_t{256} << 20;  // 測定の出力は大きいので、残すのは最後の2つ（512MB まで）
+    config.maxFiles = 2;
+    config.installCrashHandler = false;
+    return config;
+}
+
+// 1回 batch 回呼び、裏のスレッドが追いつくのを待つ（待つ時間は測らない）を rounds 回。1回あたりのナノ秒を返す。
+template <class Function>
+double perCall(const char* name, int rounds, int batch, Function function) {
+    double best = 1e30;
+    for (int round = 0; round < rounds; ++round) {
+        eco::log::flush();
+        const auto start = Clock::now();
+        for (int i = 0; i < batch; ++i) {
+            function(i);
+        }
+        const double ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count() / batch;
+        best = std::min(best, ns);
+    }
+    std::printf("  %-44s %7.2f ns/call\n", name, best);
+    return best;
+}
+
+void singleThread() {
+    std::printf("\n[1] 呼び出し1回のコスト（記録する側。%s）\n", "100000回×5周の最良");
+    constexpr int kRounds = 5;
+    constexpr int kBatch = 100000;
+    perCall("空のループ（比較の基準）", kRounds, kBatch, [](int i) { g_sink.fetch_add(i, std::memory_order_relaxed); });
+    perCall("snprintf で整形だけ（比較：普通のログの最低限）", kRounds, kBatch, [](int i) {
+        char buffer[128];
+        std::snprintf(buffer, sizeof(buffer), "player %d hp=%d pos=(%f, %f)", i, 100 - i % 100, i * 0.5, i * 0.25);
+        g_sink.fetch_add(static_cast<unsigned char>(buffer[7]), std::memory_order_relaxed);
+    });
+    eco::log::setLevel(Level::Info);
+    perCall("ECO_LOG_DEBUG（重さで切られる）", kRounds, kBatch, [](int i) { ECO_LOG_DEBUG("hidden {}", i); });
+    eco::log::setLevel(Level::Trace);
+    perCall("ECO_LOG_INFO 引数なし", kRounds, kBatch, [](int) { ECO_LOG_INFO("tick"); });
+    perCall("ECO_LOG_INFO 整数2つ＋小数2つ", kRounds, kBatch, [](int i) {
+        ECO_LOG_INFO("player {} hp={} pos=({}, {})", i, 100 - i % 100, i * 0.5, i * 0.25);
+    });
+    const std::string name = "enemy_goblin_042";
+    perCall("ECO_LOG_INFO 文字列（16文字）＋整数", kRounds, kBatch,
+            [&](int i) { ECO_LOG_INFO("spawn {} at {}", name, i); });
+    perCall("ECO_LOG_EVERY_N 1000回に1回", kRounds, kBatch,
+            [](int i) { ECO_LOG_EVERY_N(Level::Debug, 1000, "step {}", i); });
+    perCall("ECO_STAT（値の集計）", kRounds, kBatch, [](int i) { ECO_STAT("bench.value", i); });
+    perCall("ECO_COUNT（回数）", kRounds, kBatch, [](int) { ECO_COUNT("bench.count"); });
+    perCall("ECO_SCOPE_TIME（区間の時間）", kRounds, kBatch, [](int i) {
+        ECO_SCOPE_TIME("bench.scope");
+        g_sink.fetch_add(i, std::memory_order_relaxed);
+    });
+}
+
+void latency() {
+    std::printf("\n[2] ECO_LOG_INFO（整数2つ＋小数2つ）1回の時間のばらつき（100万回）\n");
+    constexpr int kCount = 1000000;
+    std::vector<std::uint64_t> samples(kCount);
+    eco::log::Clock clock;
+    eco::log::flush();
+    for (int i = 0; i < kCount; ++i) {
+        const auto start = eco::log::ticks();
+        ECO_LOG_INFO("player {} hp={} pos=({}, {})", i, 100 - i % 100, i * 0.5, i * 0.25);
+        samples[i] = eco::log::ticks() - start;
+        if (i % 200000 == 0) {
+            eco::log::flush();
+        }
+    }
+    clock.recalibrate();
+    std::sort(samples.begin(), samples.end());
+    const auto at = [&](double q) {
+        return clock.toNanoseconds(static_cast<double>(samples[static_cast<std::size_t>(q * (kCount - 1))]));
+    };
+    std::printf("  p50 %.1f ns  p99 %.1f ns  p99.9 %.1f ns  最大 %.1f ns（TSC を読む時間を含む）\n", at(0.5), at(0.99),
+                at(0.999), at(1.0));
+}
+
+void multiThread() {
+    std::printf("\n[3] 複数のスレッドから同時に（各スレッド 20万回）\n");
+    const unsigned cores = std::max(2u, std::thread::hardware_concurrency());
+    for (unsigned threads : {1u, 4u, std::min(8u, cores)}) {
+        eco::log::flush();
+        constexpr int kPerThread = 200000;
+        std::vector<std::thread> workers;
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<double> nsPerCall(threads);
+        for (unsigned t = 0; t < threads; ++t) {
+            workers.emplace_back([&, t] {
+                ECO_LOG_INFO("warm up {}", t);  // バッファを作っておく
+                ready.fetch_add(1);
+                while (!go.load()) {
+                }
+                const auto start = Clock::now();
+                for (int i = 0; i < kPerThread; ++i) {
+                    ECO_LOG_INFO("worker {} item {} value {}", t, i, i * 0.001);
+                }
+                nsPerCall[t] = std::chrono::duration<double, std::nano>(Clock::now() - start).count() / kPerThread;
+            });
+        }
+        while (ready.load() < static_cast<int>(threads)) {
+        }
+        const auto start = Clock::now();
+        go.store(true);
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        const double produceMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        eco::log::flush();
+        const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        double average = 0;
+        for (double ns : nsPerCall) {
+            average += ns / threads;
+        }
+        const double total = static_cast<double>(threads) * kPerThread;
+        std::printf("  %u スレッド：1回 %.1f ns（各スレッドの平均）、書き込み %.1f M件/秒、ファイルまで %.1f M行/秒\n",
+                    threads, average, total / produceMs / 1000.0, total / totalMs / 1000.0);
+    }
+}
+
+void frameScenario() {
+    std::printf("\n[4] 毎フレーム 5万回通る処理（60フレームの平均）\n");
+    constexpr int kFrames = 60;
+    constexpr int kCallsPerFrame = 50000;
+    const auto work = [](int i) {
+        // 衝突判定のような軽い計算の代わり
+        std::uint64_t x = static_cast<std::uint64_t>(i) * 2654435761u;
+        x ^= x >> 13;
+        return static_cast<int>(x & 1023);
+    };
+    const auto run = [&](const char* name, auto&& body) {
+        eco::log::flush();
+        const auto start = Clock::now();
+        for (int frame = 0; frame < kFrames; ++frame) {
+            ECO_FRAME();
+            for (int i = 0; i < kCallsPerFrame; ++i) {
+                body(i, work(i));
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count() / kFrames;
+        std::printf("  %-48s %.3f ms/frame\n", name, ms);
+        return ms;
+    };
+    const double base = run("ログなし", [](int, int value) { g_sink.fetch_add(value, std::memory_order_relaxed); });
+    const double stat = run("毎回 ECO_STAT", [](int, int value) {
+        g_sink.fetch_add(value, std::memory_order_relaxed);
+        ECO_STAT("frame.candidates", value);
+    });
+    const double sampled = run("毎回 ECO_STAT＋ECO_LOG_EVERY_N(10000)", [](int i, int value) {
+        g_sink.fetch_add(value, std::memory_order_relaxed);
+        ECO_STAT("frame.candidates2", value);
+        ECO_LOG_EVERY_N(Level::Debug, 10000, "candidate {} value {}", i, value);
+    });
+    const double full = run("毎回 ECO_LOG_DEBUG（全部残す）", [](int i, int value) {
+        g_sink.fetch_add(value, std::memory_order_relaxed);
+        ECO_LOG_DEBUG("candidate {} value {}", i, value);
+    });
+    std::printf("  → 1フレームあたりの増え方：集計 %.3f ms、集計＋間引き %.3f ms、全部残す %.3f ms\n", stat - base,
+                sampled - base, full - base);
+}
+
+void backendThroughput() {
+    std::printf("\n[5] 裏のスレッドの書き出し（100万行をファイルまで）\n");
+    constexpr int kCount = 1000000;
+    eco::log::flush();
+    const auto start = Clock::now();
+    for (int i = 0; i < kCount; ++i) {
+        ECO_LOG_INFO("player {} hp={} pos=({}, {})", i, 100 - i % 100, i * 0.5, i * 0.25);
+    }
+    const double produceMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    eco::log::flush();
+    const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    std::printf("  書き込み %.0f ms、ファイルまで %.0f ms（%.2f M行/秒）\n", produceMs, totalMs, kCount / totalMs / 1000.0);
+}
+
+}  // namespace
+
+int main() {
+    std::error_code error;
+    std::filesystem::remove_all(benchDirectory(), error);
+    eco::log::start(benchConfig());
+    std::printf("ECOCppLogger の性能測定（出力：%s）\n", eco::log::currentFile().string().c_str());
+    singleThread();
+    latency();
+    multiThread();
+    frameScenario();
+    backendThroughput();
+    const auto file = eco::log::currentFile();
+    eco::log::stop();
+    std::printf("\nログ：%s（%.1f MB）\n", file.string().c_str(),
+                static_cast<double>(std::filesystem::file_size(file, error)) / (1 << 20));
+    // 最後の行（session.end）に、記録した数と捨てた数がある。
+    std::FILE* input = std::fopen(file.string().c_str(), "rb");
+    if (input) {
+        std::fseek(input, -512, SEEK_END);
+        char tail[513] = {};
+        const std::size_t read = std::fread(tail, 1, 512, input);
+        std::fclose(input);
+        const std::string text(tail, read);
+        const auto position = text.rfind("\"records\"");
+        if (position != std::string::npos) {
+            std::printf("最後の行：%s", text.c_str() + position);
+        }
+    }
+    return 0;
+}

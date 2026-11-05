@@ -21,7 +21,7 @@ namespace {
 std::vector<std::filesystem::path> logFiles(const std::filesystem::path& directory) {
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.path().extension() == ".jsonl") {
+        if (entry.path().extension() == ".ecolog") {
             files.push_back(entry.path());
         }
     }
@@ -40,7 +40,7 @@ TEST(Logger, WritesSessionStartAndEnd) {
         file = eco::log::currentFile();
         EXPECT_EQ(file.parent_path(), config.directory);
         EXPECT_EQ(file.filename().string().rfind("session_", 0), 0u);
-        EXPECT_EQ(file.extension(), ".jsonl");
+        EXPECT_EQ(file.extension(), ".ecolog");
     }
     EXPECT_FALSE(eco::log::isRunning());
     const auto lines = readLines(file);

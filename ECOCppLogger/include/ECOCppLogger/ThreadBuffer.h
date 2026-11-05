@@ -3,6 +3,7 @@
 // スレッドごとの書き込み先：記録のリングバッファ（書くのは持ち主のスレッド1つ、読むのは裏のスレッド1つ）と、
 // 集計の置き場所（StatSlot）。どちらもホットパスではロックも共有の書き込みもしない。
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -199,6 +200,23 @@ public:
         }
         read_.store(read, std::memory_order_release);
         return consumed;
+    }
+
+    // まだ読んでいない部分を、続いているバイト列ごとに callback(data, size) に渡す（多くて2回：終わりで折り返すため）。
+    // 中身は記録（RecordHeader＋引数）の並びで、詰め物を含むことがある。ファイルへそのまま書き写すために使う。
+    template <class Callback>
+    std::size_t consumeSpans(Callback&& callback) {
+        std::uint64_t read = read_.load(std::memory_order_relaxed);
+        const std::uint64_t write = write_.load(std::memory_order_acquire);
+        const std::size_t total = static_cast<std::size_t>(write - read);
+        while (read < write) {
+            const std::size_t offset = static_cast<std::size_t>(read & mask_);
+            const std::size_t length = static_cast<std::size_t>(std::min<std::uint64_t>(write - read, capacity_ - offset));
+            callback(static_cast<const std::byte*>(data_ + offset), length);
+            read += length;
+        }
+        read_.store(read, std::memory_order_release);
+        return total;
     }
 
     bool empty() const noexcept {

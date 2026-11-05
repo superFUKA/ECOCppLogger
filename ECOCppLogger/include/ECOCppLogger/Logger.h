@@ -17,15 +17,27 @@
 #include "ECOCppLogger/Record.h"
 #include "ECOCppLogger/ThreadBuffer.h"
 
+// 0 にすると、ログの時刻をコンパイルで消す（Config::recordTime の確認も消える）。
+#ifndef ECO_LOG_RECORD_TIME
+#define ECO_LOG_RECORD_TIME 1
+#endif
+
 namespace eco::log {
 
 struct Config {
-    // 書き出す先。ファイル名は <stem>_<YYYYMMDD-HHMMSS>_<pid>.jsonl（stem が空なら実行ファイルの名前）。
+    // 書き出す先。ファイル名は <stem>_<YYYYMMDD-HHMMSS>_<pid>.ecolog（stem が空なら実行ファイルの名前）。
+    // 中身は2進（動いている間は文字列にしない）。見るときは ECOCppLoggerView か eco::log::readLog で文章・JSON にする。
     std::filesystem::path directory = "logs";
     std::string stem;
 
-    Level level = Level::Trace;        // これより軽いログは記録しない（実行中に setLevel で変えられる）
-    Level consoleLevel = Level::Warn;  // これ以上の重さは標準エラーにも出す（Off で出さない）
+    Level level = Level::Trace;       // これより軽いログは記録しない（実行中に setLevel で変えられる）
+    Level consoleLevel = Level::Off;  // これ以上の重さは標準エラーにも文章で出す（そのぶん裏のスレッドが文字列を作る）
+
+    // ログ1件ごとに時刻を残すか。false にすると TSC を読まない（1件あたり数ns・8バイト軽くなる）が、
+    // 表示はスレッドの中の順番だけになり、スレッドをまたいだ前後は裏のスレッドが書き写した順（約2ms単位）になる。
+    bool recordTime = true;
+    // ログ1件ごとに今のフレーム番号（ECO_FRAME）を残すか。
+    bool recordFrame = true;
 
     std::size_t threadBufferBytes = std::size_t{1} << 20;  // スレッドごとのリングバッファ（2のべき乗に切り上げ）
     std::uint32_t pollIntervalMs = 2;                      // 裏のスレッドが記録を見に行く間隔
@@ -72,6 +84,8 @@ namespace detail {
 extern std::atomic<std::uint8_t> g_level;
 extern std::atomic<std::uint64_t> g_frame;
 extern std::atomic<std::uint64_t> g_statEpoch;
+extern std::atomic<bool> g_recordTime;
+extern std::atomic<bool> g_recordFrame;
 
 // 重さが Error 以上の記録を書いたら、裏のスレッドをすぐ起こす（落ちる前に書き出せるように）。
 void wakeBackend() noexcept;
@@ -89,8 +103,15 @@ inline void emitNormalized(const Site& site, std::uint64_t aux, const Normalized
         buffer->countDrop();
         return;
     }
-    RecordHeader header{static_cast<std::uint32_t>(size), RecordKind::Log, ticks(),
-                        g_frame.load(std::memory_order_relaxed), &site, aux};
+#if ECO_LOG_RECORD_TIME
+    const std::uint64_t tick = g_recordTime.load(std::memory_order_relaxed) ? ticks() : 0;
+#else
+    const std::uint64_t tick = 0;
+#endif
+    const std::uint64_t frameNumber = g_recordFrame.load(std::memory_order_relaxed)
+                                          ? g_frame.load(std::memory_order_relaxed)
+                                          : 0;
+    RecordHeader header{static_cast<std::uint32_t>(size), RecordKind::Log, tick, frameNumber, &site, aux};
     std::memcpy(out, &header, sizeof(header));
     std::byte* cursor = out + sizeof(RecordHeader);
     ((cursor = encode(cursor, values)), ...);

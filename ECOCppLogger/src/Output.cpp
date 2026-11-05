@@ -41,6 +41,75 @@ T readValue(const std::byte*& cursor) {
     return value;
 }
 
+// 人向けの重さの欄（幅をそろえる）。
+std::string_view levelColumn(std::string_view level) {
+    if (level == "trace") return "TRACE";
+    if (level == "debug") return "DEBUG";
+    if (level == "info") return "INFO ";
+    if (level == "warn") return "WARN ";
+    if (level == "error") return "ERROR";
+    if (level == "fatal") return "FATAL";
+    if (level == "stat") return "STAT ";
+    if (level == "history") return "HIST ";
+    return level;
+}
+
+// JSON の中身（1段だけ："k":v,"k":v,…）を key=value の並びにする（人向け）。lv は別に返す。
+void flatJsonToText(std::string& out, std::string_view body, std::string& level) {
+    std::size_t i = 0;
+    bool first = true;
+    while (i < body.size()) {
+        if (body[i] != '"') {
+            ++i;
+            continue;
+        }
+        const std::size_t keyEnd = body.find('"', i + 1);
+        if (keyEnd == std::string_view::npos || keyEnd + 1 >= body.size() || body[keyEnd + 1] != ':') {
+            break;
+        }
+        const std::string_view key = body.substr(i + 1, keyEnd - i - 1);
+        std::size_t valueStart = keyEnd + 2;
+        std::size_t j = valueStart;
+        int depth = 0;
+        bool inString = false;
+        for (; j < body.size(); ++j) {
+            const char c = body[j];
+            if (inString) {
+                if (c == '\\') ++j;
+                else if (c == '"') inString = false;
+            } else if (c == '"') inString = true;
+            else if (c == '[' || c == '{') ++depth;
+            else if (c == ']' || c == '}') --depth;
+            else if (c == ',' && depth == 0) break;
+        }
+        std::string_view value = body.substr(valueStart, j - valueStart);
+        std::string unescaped;
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            // 文字列は " を外し、\\ \" \n 等を元に戻す（人向け）
+            value = value.substr(1, value.size() - 2);
+            for (std::size_t k = 0; k < value.size(); ++k) {
+                if (value[k] == '\\' && k + 1 < value.size()) {
+                    const char escaped = value[++k];
+                    unescaped.push_back(escaped == 'n' ? '\n' : escaped == 't' ? '\t' : escaped);
+                } else {
+                    unescaped.push_back(value[k]);
+                }
+            }
+            value = unescaped;
+        }
+        if (key == "lv") {
+            level = value;
+        } else {
+            if (!first) out.push_back(' ');
+            first = false;
+            out.append(key);
+            out.push_back('=');
+            out.append(value);
+        }
+        i = j + 1;
+    }
+}
+
 }  // namespace
 
 void appendJsonString(std::string& out, std::string_view text) {
@@ -190,12 +259,59 @@ int localUtcOffsetMinutes() {
     return static_cast<int>(difference / 60.0);
 }
 
-LineFormatter::LineFormatter(const Clock& clock, bool fullPath)
-    : clock_(clock), fullPath_(fullPath), utcOffsetMinutes_(localUtcOffsetMinutes()) {}
+void renderMessage(std::string& out, const Site& site, const std::byte* cursor) {
+    std::size_t argument = 0;
+    const std::string_view format = site.format;
+    for (std::size_t i = 0; i < format.size(); ++i) {
+        const char c = format[i];
+        if ((c == '{' || c == '}') && i + 1 < format.size() && format[i + 1] == c) {
+            out.push_back(c);
+            ++i;
+            continue;
+        }
+        if (c != '{' || i + 1 >= format.size() || format[i + 1] != '}' || argument >= site.argCount) {
+            out.push_back(c);
+            continue;
+        }
+        ++i;
+        switch (site.tags[argument++]) {
+        case ArgTag::Bool: out.append(readValue<bool>(cursor) ? "true" : "false"); break;
+        case ArgTag::Char: out.push_back(readValue<char>(cursor)); break;
+        case ArgTag::Int: appendSigned(out, readValue<std::int64_t>(cursor)); break;
+        case ArgTag::UInt: appendUnsigned(out, readValue<std::uint64_t>(cursor)); break;
+        case ArgTag::Double: appendDouble(out, readValue<double>(cursor)); break;
+        case ArgTag::String: {
+            const auto stored = readValue<std::uint32_t>(cursor);
+            const std::uint32_t length = stored & 0x7FFFFFFFu;
+            out.append(reinterpret_cast<const char*>(cursor), length);
+            cursor += length;
+            if (stored & 0x80000000u) {
+                out.append("…");
+            }
+            break;
+        }
+        case ArgTag::Pointer: {
+            const auto address = readValue<std::uint64_t>(cursor);
+            char buffer[24] = {'0', 'x'};
+            const auto result = std::to_chars(buffer + 2, buffer + sizeof(buffer), address, 16);
+            out.append(buffer, result.ptr);
+            break;
+        }
+        case ArgTag::None: break;
+        }
+    }
+}
 
-void LineFormatter::appendLineStart(std::string& out, std::uint64_t tick) {
-    // 秒までの部分は、同じ秒の間は使い回す（毎行の年月日の計算をなくす）。
-    const std::int64_t unixNanoseconds = clock_.toUnixNanoseconds(tick);
+void LineFormatter::appendTime(std::string& out, std::uint64_t tick) {
+    if (tick == 0) {
+        // 時刻を記録しない設定
+        if (format_ == OutputFormat::Text) {
+            out.append("--:--:--.------");
+        }
+        return;
+    }
+    // 秒までの部分は、同じ秒の間は使い回す。
+    const std::int64_t unixNanoseconds = timeBase_.toUnixNanoseconds(tick);
     std::int64_t second = unixNanoseconds / 1'000'000'000LL;
     std::int64_t nanoseconds = unixNanoseconds % 1'000'000'000LL;
     if (nanoseconds < 0) {
@@ -204,10 +320,15 @@ void LineFormatter::appendLineStart(std::string& out, std::uint64_t tick) {
     }
     if (second != cachedSecond_ || cachedPrefix_.empty()) {
         std::string full;
-        appendTimestamp(full, second * 1'000'000'000LL, utcOffsetMinutes_);
+        appendTimestamp(full, second * 1'000'000'000LL, timeBase_.utcOffsetMinutes);
         const std::size_t dot = full.find('.');
-        cachedPrefix_ = "{\"t\":\"" + full.substr(0, dot + 1);
-        cachedSuffix_ = full.substr(dot + 7) + "\"";
+        if (format_ == OutputFormat::Json) {
+            cachedPrefix_ = "\"t\":\"" + full.substr(0, dot + 1);
+            cachedSuffix_ = full.substr(dot + 7) + "\"";
+        } else {
+            cachedPrefix_ = full.substr(dot - 8, 9);  // "HH:MM:SS."
+            cachedSuffix_.clear();
+        }
         cachedSecond_ = second;
     }
     out.append(cachedPrefix_);
@@ -215,87 +336,77 @@ void LineFormatter::appendLineStart(std::string& out, std::uint64_t tick) {
     out.append(cachedSuffix_);
 }
 
-void LineFormatter::renderMessage(const RecordHeader& header) {
-    const Site& site = *header.site;
+void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, const Site& site,
+                                 std::string_view thread) {
     message_.clear();
-    const std::byte* cursor = reinterpret_cast<const std::byte*>(&header) + sizeof(RecordHeader);
-    std::size_t argument = 0;
-    const std::string_view format = site.format;
-    for (std::size_t i = 0; i < format.size(); ++i) {
-        const char c = format[i];
-        if ((c == '{' || c == '}') && i + 1 < format.size() && format[i + 1] == c) {
-            message_.push_back(c);
-            ++i;
-            continue;
-        }
-        if (c != '{' || i + 1 >= format.size() || format[i + 1] != '}' || argument >= site.argCount) {
-            message_.push_back(c);
-            continue;
-        }
-        ++i;
-        switch (site.tags[argument++]) {
-        case ArgTag::Bool: message_.append(readValue<bool>(cursor) ? "true" : "false"); break;
-        case ArgTag::Char: message_.push_back(readValue<char>(cursor)); break;
-        case ArgTag::Int: appendSigned(message_, readValue<std::int64_t>(cursor)); break;
-        case ArgTag::UInt: appendUnsigned(message_, readValue<std::uint64_t>(cursor)); break;
-        case ArgTag::Double: appendDouble(message_, readValue<double>(cursor)); break;
-        case ArgTag::String: {
-            const auto stored = readValue<std::uint32_t>(cursor);
-            const std::uint32_t length = stored & 0x7FFFFFFFu;
-            message_.append(reinterpret_cast<const char*>(cursor), length);
-            cursor += length;
-            if (stored & 0x80000000u) {
-                message_.append("…");
-            }
-            break;
-        }
-        case ArgTag::Pointer: {
-            const auto address = readValue<std::uint64_t>(cursor);
-            char buffer[24] = {'0', 'x'};
-            const auto result = std::to_chars(buffer + 2, buffer + sizeof(buffer), address, 16);
-            message_.append(buffer, result.ptr);
-            break;
-        }
-        case ArgTag::None: break;
-        }
-    }
-}
+    renderMessage(message_, site, reinterpret_cast<const std::byte*>(&header) + sizeof(RecordHeader));
+    source_.assign(sourceFileName(site.file, fullPath_));
+    source_.push_back(':');
+    appendUnsigned(source_, site.line);
+    const auto sampling = static_cast<Sampling>(site.sampling);
 
-void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, std::string_view threadName) {
-    const Site& site = *header.site;
-    renderMessage(header);
-    appendLineStart(out, header.tick);
+    if (format_ == OutputFormat::Text) {
+        appendTime(out, header.tick);
+        if (header.frame != 0) {
+            out.append(" f");
+            appendUnsigned(out, header.frame);
+        }
+        out.push_back(' ');
+        out.append(levelColumn(levelName(site.level)));
+        out.append(" [");
+        out.append(thread);
+        out.append("] ");
+        out.append(source_);
+        out.push_back(' ');
+        out.append(shortFunctionName(site.function));
+        out.append(": ");
+        out.append(message_);
+        switch (sampling) {
+        case Sampling::EveryN:
+        case Sampling::FirstN:
+            out.append(sampling == Sampling::EveryN ? "  (every " : "  (first ");
+            appendUnsigned(out, site.samplingValue);
+            out.append(", #");
+            appendUnsigned(out, header.aux);
+            out.push_back(')');
+            break;
+        case Sampling::EveryMs:
+            out.append("  (every ");
+            appendUnsigned(out, site.samplingValue);
+            out.append("ms, skipped ");
+            appendUnsigned(out, header.aux);
+            out.push_back(')');
+            break;
+        case Sampling::OnChange:
+        case Sampling::None: break;
+        }
+        out.push_back('\n');
+        return;
+    }
+
+    out.push_back('{');
+    const std::size_t start = out.size();
+    appendTime(out, header.tick);
     if (header.frame != 0) {
-        out.append(",\"f\":");
+        if (out.size() != start) out.push_back(',');
+        out.append("\"f\":");
         appendUnsigned(out, header.frame);
     }
-    out.append(",\"lv\":\"");
+    if (out.size() != start) out.push_back(',');
+    out.append("\"lv\":\"");
     out.append(levelName(site.level));
     out.append("\",\"th\":");
-    appendJsonString(out, threadName);
-    // 呼び出し位置ごとに変わらない部分（src・fn）は、最初の1回だけ作って使い回す。
-    auto [entry, inserted] = siteCache_.try_emplace(&site);
-    if (inserted) {
-        std::string source(sourceFileName(site.file, fullPath_));  // フルパスの \ はエスケープが要る
-        source.push_back(':');
-        appendUnsigned(source, site.line);
-        entry->second.append(",\"src\":");
-        appendJsonString(entry->second, source);
-        entry->second.append(",\"fn\":");
-        appendJsonString(entry->second, shortFunctionName(site.function));
-        entry->second.append(",\"msg\":");
-    }
-    out.append(entry->second);
+    appendJsonString(out, thread);
+    out.append(",\"src\":");
+    appendJsonString(out, source_);
+    out.append(",\"fn\":");
+    appendJsonString(out, shortFunctionName(site.function));
+    out.append(",\"msg\":");
     appendJsonString(out, message_);
-    switch (static_cast<Sampling>(site.sampling)) {
+    switch (sampling) {
     case Sampling::EveryN:
-        out.append(",\"sample\":\"every ");
-        appendUnsigned(out, site.samplingValue);
-        out.append("\",\"n\":");
-        appendUnsigned(out, header.aux);
-        break;
     case Sampling::FirstN:
-        out.append(",\"sample\":\"first ");
+        out.append(sampling == Sampling::EveryN ? ",\"sample\":\"every " : ",\"sample\":\"first ");
         appendUnsigned(out, site.samplingValue);
         out.append("\",\"n\":");
         appendUnsigned(out, header.aux);
@@ -312,6 +423,27 @@ void LineFormatter::appendRecord(std::string& out, const RecordHeader& header, s
         break;
     case Sampling::None: break;
     }
+    out.append("}\n");
+}
+
+void LineFormatter::appendEvent(std::string& out, std::uint64_t tick, std::string_view body) {
+    if (format_ == OutputFormat::Text) {
+        appendTime(out, tick);
+        std::string level;
+        std::string fields;
+        flatJsonToText(fields, body, level);
+        out.push_back(' ');
+        out.append(levelColumn(level));
+        out.push_back(' ');
+        out.append(fields);
+        out.push_back('\n');
+        return;
+    }
+    out.push_back('{');
+    const std::size_t start = out.size();
+    appendTime(out, tick);
+    if (out.size() != start && !body.empty()) out.push_back(',');
+    out.append(body);
     out.append("}\n");
 }
 

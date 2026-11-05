@@ -6,13 +6,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "CrashHandler.h"
+#include "FileFormat.h"
 #include "Output.h"
 
 #if defined(_WIN32)
@@ -31,19 +35,14 @@ namespace detail {
 std::atomic<std::uint8_t> g_level{static_cast<std::uint8_t>(Level::Trace)};
 std::atomic<std::uint64_t> g_frame{0};
 std::atomic<std::uint64_t> g_statEpoch{1};  // StatSlot::epoch の初期値 0 と違う値から始める
+std::atomic<bool> g_recordTime{true};
+std::atomic<bool> g_recordFrame{true};
 
 }  // namespace detail
 
 namespace {
 
-constexpr std::string_view kAbout =
-    "JSON Lines log from ECOCppLogger. t=local time, f=frame number, lv=level, th=thread, src=file:line, "
-    "fn=function, msg=message. sample=this site is sampled (n=call count, skipped=calls not logged since the "
-    "previous line). lv=stat lines aggregate ECO_STAT/ECO_COUNT/ECO_SCOPE_TIME over period_ms: n=calls in "
-    "the period, total=calls since start, unit=us means durations in microseconds. event=dropped means the "
-    "thread's buffer was full and that many records were lost. sample=on change lines are written only when the "
-    "value changed (change=0 is the first value). lv=history lines list the most recent values of ECO_HISTORY "
-    "kept in memory, written on crash or dumpHistory(reason); points are [f, ms before t, value], oldest first.";
+namespace file = detail::file;
 
 std::int64_t processId() {
 #if defined(_WIN32)
@@ -69,6 +68,13 @@ std::string pathUtf8(const std::filesystem::path& path) {
     return std::string(reinterpret_cast<const char*>(text.data()), text.size());
 }
 
+std::string sourceOf(const char* fileName, std::uint32_t line, bool fullPath) {
+    std::string source(detail::sourceFileName(fileName, fullPath));
+    source.push_back(':');
+    detail::appendUnsigned(source, line);
+    return source;
+}
+
 struct StatTotal {
     const StatSite* site = nullptr;
     std::uint64_t count = 0;
@@ -87,14 +93,28 @@ struct HistoryCapture {
     std::vector<HistoryRing::Point> points;
 };
 
-std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emergency);
-
-// 1回の取り出しで集めた行（スレッドをまたいで時刻の順に並べ直すため）。
-struct PendingLine {
-    std::uint64_t tick;
-    std::uint32_t offset;
-    std::uint32_t length;
-};
+// 呼んだスレッドの上で、全スレッドの最近の値を写す（裏のスレッドが読むまで待つと、その間に上書きされるため）。
+std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emergency) {
+    std::vector<HistoryCapture> captures;
+    for (auto& entry : Registry::instance().snapshot(emergency)) {
+        entry.buffer->forEachStat([&](StatSlot& slot) {
+            const HistoryRing* ring = slot.history.load(std::memory_order_acquire);
+            if (!ring) {
+                return;
+            }
+            HistoryCapture capture{slot.site.load(std::memory_order_acquire), entry.name, {}};
+            ring->read([&](const HistoryRing::Point& point) {
+                if (point.tick <= untilTick) {  // 頼まれた後の値は含めない
+                    capture.points.push_back(point);
+                }
+            });
+            if (!capture.points.empty()) {
+                captures.push_back(std::move(capture));
+            }
+        });
+    }
+    return captures;
+}
 
 class Backend {
 public:
@@ -103,23 +123,11 @@ public:
     void flush(bool stats);
     void wake() noexcept;
     void emergency(std::string_view reason, const std::string& extraJson) noexcept;
+    void requestDump(std::string_view reason);
 
     std::atomic<bool> running{false};
     std::filesystem::path path;
     std::mutex controlMutex;  // start・stop を1つずつ
-
-private:
-    void run();
-    void drain(bool emergency);
-    void emitStats(bool emergency);
-    void writeOut();
-    bool openFile();
-    void writeSessionStart();
-    void writeSessionEnd(bool crashed);
-    void writeHistories(std::string_view reason, std::uint64_t untilTick, const std::vector<HistoryCapture>& captures);
-
-public:
-    void requestDump(std::string_view reason);
 
 private:
     struct DumpRequest {
@@ -127,12 +135,26 @@ private:
         std::uint64_t tick;
         std::vector<HistoryCapture> captures;
     };
-    std::mutex dumpMutex_;
-    std::vector<DumpRequest> dumps_;
+
+    void run();
+    void drain(bool emergency);
+    void emitStats(bool emergency);
+    void writeHistories(std::string_view reason, std::uint64_t untilTick, const std::vector<HistoryCapture>& captures);
+    void writeSessionStart();
+    void writeSessionEnd(bool crashed);
+
+    // ---- ファイルへの書き込み（2進。文字列にするのはめったにない Event の中身だけ） ----
+    bool openFile();
+    void writeOut();
+    void appendFrame(file::FrameType type, std::initializer_list<std::pair<const void*, std::size_t>> parts);
+    void writeClock();
+    void writeSiteDef(const Site& site);
+    void writeEvent(std::uint64_t tick, std::string_view body);
+    void writeConsole(const RecordHeader& header, std::string_view thread);
 
     Config config_;
     std::unique_ptr<Clock> clock_;
-    std::unique_ptr<detail::LineFormatter> formatter_;
+    std::unique_ptr<detail::LineFormatter> console_;  // consoleLevel が Off でないときだけ
 
     std::timed_mutex io_;  // 取り出し・書き出しの間
     std::FILE* file_ = nullptr;
@@ -141,8 +163,15 @@ private:
     std::string baseName_;
     std::deque<std::filesystem::path> files_;
     std::string out_;
-    std::string lines_;
-    std::vector<PendingLine> pending_;
+    std::string event_;
+
+    // このファイルに書いた呼び出し位置・スレッドの名前（ファイルを替えたら書き直す）
+    std::unordered_set<const Site*> knownSites_;
+    const Site* lastSite_ = nullptr;
+    std::unordered_map<std::uint32_t, std::string> knownThreads_;
+
+    std::mutex dumpMutex_;
+    std::vector<DumpRequest> dumps_;
 
     std::thread thread_;
     std::mutex wakeMutex_;
@@ -170,6 +199,48 @@ void stopAtExit() {
     backend().stop();
 }
 
+void Backend::appendFrame(file::FrameType type, std::initializer_list<std::pair<const void*, std::size_t>> parts) {
+    std::size_t size = 0;
+    for (const auto& part : parts) {
+        size += part.second;
+    }
+    const file::FrameHeader header{type, static_cast<std::uint32_t>(size)};
+    out_.append(reinterpret_cast<const char*>(&header), sizeof(header));
+    for (const auto& part : parts) {
+        out_.append(static_cast<const char*>(part.first), part.second);
+    }
+}
+
+void Backend::writeClock() {
+    const file::ClockPayload payload{clock_->baseTick(), clock_->baseUnixNanoseconds(), clock_->ticksPerNanosecond(),
+                                     detail::localUtcOffsetMinutes(), 0};
+    appendFrame(file::FrameType::Clock, {{&payload, sizeof(payload)}});
+}
+
+void Backend::writeSiteDef(const Site& site) {
+    const file::SiteDefPayload payload{reinterpret_cast<std::uint64_t>(&site), site.samplingValue, site.line,
+                                       static_cast<std::uint8_t>(site.level), site.sampling, site.argCount, 0};
+    const std::string_view fileName = site.file;
+    const std::string_view function = site.function;
+    const auto formatLength = static_cast<std::uint32_t>(site.format.size());
+    const auto fileLength = static_cast<std::uint32_t>(fileName.size());
+    const auto functionLength = static_cast<std::uint32_t>(function.size());
+    appendFrame(file::FrameType::SiteDef,
+                {{&payload, sizeof(payload)},
+                 {site.tags, site.argCount},
+                 {&formatLength, 4},
+                 {site.format.data(), formatLength},
+                 {&fileLength, 4},
+                 {fileName.data(), fileLength},
+                 {&functionLength, 4},
+                 {function.data(), functionLength}});
+    knownSites_.insert(&site);
+}
+
+void Backend::writeEvent(std::uint64_t tick, std::string_view body) {
+    appendFrame(file::FrameType::Event, {{&tick, 8}, {body.data(), body.size()}});
+}
+
 bool Backend::openFile() {
     std::error_code error;
     std::filesystem::create_directories(config_.directory, error);
@@ -177,10 +248,10 @@ bool Backend::openFile() {
     if (part_ > 1) {
         name += "_part" + std::to_string(part_);
     }
-    name += ".jsonl";
+    name += ".ecolog";
     path = config_.directory / std::filesystem::path(std::u8string(name.begin(), name.end()));
 #if defined(_WIN32)
-    file_ = _wfsopen(path.c_str(), L"wb", _SH_DENYWR);
+    file_ = _wfsopen(path.c_str(), L"wb", _SH_DENYWR);  // ほかのプログラムが読むのは許す
 #else
     file_ = std::fopen(path.c_str(), "wb");
 #endif
@@ -194,7 +265,33 @@ bool Backend::openFile() {
         std::filesystem::remove(files_.front(), error);
         files_.pop_front();
     }
+    // ファイルごとに読めるように、頭・時刻の換算・始めの Event を書き、呼び出し位置・スレッドは書き直す。
+    knownSites_.clear();
+    lastSite_ = nullptr;
+    knownThreads_.clear();
+    out_.append(file::kMagic, sizeof(file::kMagic));
+    out_.append(reinterpret_cast<const char*>(&file::kVersion), sizeof(file::kVersion));
+    writeClock();
+    writeSessionStart();
     return true;
+}
+
+void Backend::writeOut() {
+    if (out_.empty() || !file_) {
+        out_.clear();
+        return;
+    }
+    std::fwrite(out_.data(), 1, out_.size(), file_);
+    fileBytes_ += out_.size();
+    out_.clear();
+    if (config_.maxFileBytes > 0 && fileBytes_ >= config_.maxFileBytes) {
+        std::fclose(file_);
+        file_ = nullptr;
+        ++part_;
+        if (openFile()) {
+            writeOut();
+        }
+    }
 }
 
 bool Backend::start(const Config& config) {
@@ -205,8 +302,13 @@ bool Backend::start(const Config& config) {
     config_ = config;
     detail::setThreadBufferBytes(config_.threadBufferBytes);
     detail::g_level.store(static_cast<std::uint8_t>(config_.level), std::memory_order_relaxed);
+    detail::g_recordTime.store(config_.recordTime, std::memory_order_relaxed);
+    detail::g_recordFrame.store(config_.recordFrame, std::memory_order_relaxed);
     clock_ = std::make_unique<Clock>();
-    formatter_ = std::make_unique<detail::LineFormatter>(*clock_, config_.fullPath);
+    console_.reset();
+    if (config_.consoleLevel != Level::Off) {
+        console_ = std::make_unique<detail::LineFormatter>(detail::OutputFormat::Text, false);
+    }
 
     std::string stem = config_.stem.empty() ? pathUtf8(executablePath().stem()) : config_.stem;
     if (stem.empty()) {
@@ -220,19 +322,20 @@ bool Backend::start(const Config& config) {
     baseName_ = stem + "_" + stamp + "_" + std::to_string(processId());
     part_ = 1;
     files_.clear();
-    if (!openFile()) {
-        return false;
-    }
     records_ = 0;
     dropped_ = 0;
-    lastStatTick_ = ticks();
-    lastStatFrame_ = detail::g_frame.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(io_);
-        writeSessionStart();
+        crashed_.store(false);
+        if (!openFile()) {
+            out_.clear();
+            return false;
+        }
         writeOut();
         std::fflush(file_);
     }
+    lastStatTick_ = ticks();
+    lastStatFrame_ = detail::g_frame.load(std::memory_order_relaxed);
     static std::once_flag registerExit;
     std::call_once(registerExit, [] { std::atexit(stopAtExit); });
     if (config_.installCrashHandler) {
@@ -331,62 +434,75 @@ void Backend::run() {
     }
 }
 
+void Backend::writeConsole(const RecordHeader& header, std::string_view thread) {
+    std::string line;
+    console_->setTimeBase({clock_->baseTick(), clock_->baseUnixNanoseconds(), clock_->ticksPerNanosecond(),
+                           detail::localUtcOffsetMinutes()});
+    console_->appendRecord(line, header, *header.site, thread);
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}
+
 void Backend::drain(bool emergency) {
-    auto entries = Registry::instance().snapshot(emergency);
-    lines_.clear();
-    pending_.clear();
-    for (auto& entry : entries) {
+    for (auto& entry : Registry::instance().snapshot(emergency)) {
         ThreadBuffer* buffer = entry.buffer;
-        buffer->consume([&](const RecordHeader& header) {
-            const auto offset = static_cast<std::uint32_t>(lines_.size());
-            formatter_->appendRecord(lines_, header, entry.name);
-            pending_.push_back({header.tick, offset, static_cast<std::uint32_t>(lines_.size() - offset)});
-            if (header.site->level >= config_.consoleLevel && config_.consoleLevel != Level::Off) {
-                std::string console = "[";
-                console.append(levelName(header.site->level));
-                console.append("] ");
-                console.append(detail::sourceFileName(header.site->file, false));
-                console.push_back(':');
-                detail::appendUnsigned(console, header.site->line);
-                console.push_back(' ');
-                console.append(formatter_->lastMessage());
-                console.push_back('\n');
-                std::fwrite(console.data(), 1, console.size(), stderr);
+        const std::uint32_t index = buffer->index();
+        const bool hasRecords = !buffer->empty();
+        if (hasRecords) {
+            auto known = knownThreads_.find(index);
+            if (known == knownThreads_.end() || known->second != entry.name) {
+                appendFrame(file::FrameType::ThreadDef, {{&index, 4}, {entry.name.data(), entry.name.size()}});
+                knownThreads_[index] = entry.name;
+            }
+        }
+        const std::uint64_t drainTick = ticks();
+        buffer->consumeSpans([&](const std::byte* data, std::size_t length) {
+            // 初めての呼び出し位置だけ SiteDef を先に書く（ほかは記録の頭を見るだけ）。
+            for (std::size_t offset = 0; offset < length;) {
+                // 詰め物は 8 バイトしかないことがあるので、まず大きさと種類だけ読む。
+                RecordHeader header;
+                std::memcpy(&header, data + offset, 8);
+                if (header.kind == RecordKind::Log) {
+                    std::memcpy(&header, data + offset, sizeof(header));
+                    if (header.site != lastSite_) {
+                        if (!knownSites_.contains(header.site)) {
+                            writeSiteDef(*header.site);
+                        }
+                        lastSite_ = header.site;
+                    }
+                    ++records_;
+                    if (console_ && header.site->level >= config_.consoleLevel) {
+                        writeConsole(*reinterpret_cast<const RecordHeader*>(data + offset), entry.name);
+                    }
+                }
+                offset += header.size;
+            }
+            // リングバッファの中身をそのまま書き写す。
+            const std::uint32_t reserved = 0;
+            appendFrame(file::FrameType::Block, {{&index, 4}, {&reserved, 4}, {&drainTick, 8}, {data, length}});
+            if (out_.size() >= (std::size_t{4} << 20)) {
+                writeOut();
             }
         });
         const std::uint64_t dropped = buffer->dropped();
         if (dropped > buffer->reportedDropped) {
-            const std::uint64_t tick = ticks();
-            const auto offset = static_cast<std::uint32_t>(lines_.size());
-            formatter_->appendLineStart(lines_, tick);
-            lines_.append(",\"lv\":\"warn\",\"event\":\"dropped\",\"th\":");
-            detail::appendJsonString(lines_, entry.name);
-            lines_.append(",\"count\":");
-            detail::appendUnsigned(lines_, dropped - buffer->reportedDropped);
-            lines_.append(",\"total\":");
-            detail::appendUnsigned(lines_, dropped);
-            lines_.append("}\n");
-            pending_.push_back({tick, offset, static_cast<std::uint32_t>(lines_.size() - offset)});
+            event_ = "\"lv\":\"warn\",\"event\":\"dropped\",\"th\":";
+            detail::appendJsonString(event_, entry.name);
+            event_.append(",\"count\":");
+            detail::appendUnsigned(event_, dropped - buffer->reportedDropped);
+            event_.append(",\"total\":");
+            detail::appendUnsigned(event_, dropped);
+            writeEvent(ticks(), event_);
             dropped_ += dropped - buffer->reportedDropped;
             buffer->reportedDropped = dropped;
         }
     }
-    // スレッドをまたいで時刻の順に（同じ時刻ならスレッドの中の順のまま）。
-    std::stable_sort(pending_.begin(), pending_.end(),
-                     [](const PendingLine& a, const PendingLine& b) { return a.tick < b.tick; });
-    for (const PendingLine& line : pending_) {
-        out_.append(lines_, line.offset, line.length);
-        if (out_.size() >= (1 << 20)) {
-            writeOut();
-        }
-    }
-    records_ += pending_.size();
 }
 
 void Backend::emitStats(bool emergency) {
     const std::uint64_t now = ticks();
     const std::uint64_t epoch = detail::g_statEpoch.fetch_add(1, std::memory_order_acq_rel);
     clock_->recalibrate();
+    writeClock();  // 測る区間が長いほど正確になるので、読む側は最後の Clock を使う
 
     std::map<std::string_view, StatTotal> totals;  // 名前の順に出す
     std::vector<ThreadBuffer*> finished;
@@ -437,42 +553,38 @@ void Backend::emitStats(bool emergency) {
     for (auto& [name, total] : totals) {
         const StatSite& site = *total.site;
         const double scale = site.kind == StatKind::Duration ? 1.0 / (clock_->ticksPerNanosecond() * 1000.0) : 1.0;
-        formatter_->appendLineStart(out_, now);
-        out_.append(",\"lv\":\"stat\",\"stat\":");
-        detail::appendJsonString(out_, name);
-        std::string source(detail::sourceFileName(site.file, config_.fullPath));
-        source.push_back(':');
-        detail::appendUnsigned(source, site.line);
-        out_.append(",\"src\":");
-        detail::appendJsonString(out_, source);
-        out_.append(",\"n\":");
-        detail::appendUnsigned(out_, total.count);
+        event_ = "\"lv\":\"stat\",\"stat\":";
+        detail::appendJsonString(event_, name);
+        event_.append(",\"src\":");
+        detail::appendJsonString(event_, sourceOf(site.file, site.line, config_.fullPath));
+        event_.append(",\"n\":");
+        detail::appendUnsigned(event_, total.count);
         if (site.kind != StatKind::Count) {
-            out_.append(",\"sum\":");
-            detail::appendDouble(out_, total.sum * scale);
-            out_.append(",\"avg\":");
-            detail::appendDouble(out_, total.sum * scale / static_cast<double>(total.count));
-            out_.append(",\"min\":");
-            detail::appendDouble(out_, total.minimum * scale);
-            out_.append(",\"max\":");
-            detail::appendDouble(out_, total.maximum * scale);
-            out_.append(",\"last\":");
-            detail::appendDouble(out_, total.last * scale);
+            event_.append(",\"sum\":");
+            detail::appendDouble(event_, total.sum * scale);
+            event_.append(",\"avg\":");
+            detail::appendDouble(event_, total.sum * scale / static_cast<double>(total.count));
+            event_.append(",\"min\":");
+            detail::appendDouble(event_, total.minimum * scale);
+            event_.append(",\"max\":");
+            detail::appendDouble(event_, total.maximum * scale);
+            event_.append(",\"last\":");
+            detail::appendDouble(event_, total.last * scale);
         }
         if (site.kind == StatKind::Duration) {
-            out_.append(",\"unit\":\"us\"");
+            event_.append(",\"unit\":\"us\"");
         }
-        out_.append(",\"total\":");
-        detail::appendUnsigned(out_, total.total);
-        out_.append(",\"threads\":");
-        detail::appendUnsigned(out_, total.threads);
-        out_.append(",\"period_ms\":");
-        detail::appendUnsigned(out_, static_cast<std::uint64_t>(periodMs + 0.5));
+        event_.append(",\"total\":");
+        detail::appendUnsigned(event_, total.total);
+        event_.append(",\"threads\":");
+        detail::appendUnsigned(event_, total.threads);
+        event_.append(",\"period_ms\":");
+        detail::appendUnsigned(event_, static_cast<std::uint64_t>(periodMs + 0.5));
         if (frame != lastStatFrame_) {
-            out_.append(",\"frames\":");
-            detail::appendUnsigned(out_, frame - lastStatFrame_);
+            event_.append(",\"frames\":");
+            detail::appendUnsigned(event_, frame - lastStatFrame_);
         }
-        out_.append("}\n");
+        writeEvent(now, event_);
     }
     lastStatTick_ = now;
     lastStatFrame_ = frame;
@@ -481,77 +593,33 @@ void Backend::emitStats(bool emergency) {
     }
 }
 
-void Backend::writeOut() {
-    if (out_.empty() || !file_) {
-        out_.clear();
-        return;
-    }
-    std::fwrite(out_.data(), 1, out_.size(), file_);
-    fileBytes_ += out_.size();
-    out_.clear();
-    if (config_.maxFileBytes > 0 && fileBytes_ >= config_.maxFileBytes) {
-        std::fclose(file_);
-        file_ = nullptr;
-        ++part_;
-        if (openFile()) {
-            writeSessionStart();  // 新しいファイルの頭にも、何のログかを書く
-            writeOut();
-        }
-    }
-}
-
 void Backend::writeSessionStart() {
-    formatter_->appendLineStart(out_, ticks());
-    out_.append(",\"lv\":\"info\",\"event\":\"session.start\",\"pid\":");
-    detail::appendSigned(out_, processId());
-    out_.append(",\"exe\":");
-    detail::appendJsonString(out_, pathUtf8(executablePath()));
-    out_.append(",\"part\":");
-    detail::appendUnsigned(out_, part_);
-    out_.append(",\"level\":\"");
-    out_.append(levelName(static_cast<Level>(detail::g_level.load())));
-    out_.append("\",\"stat_interval_ms\":");
-    detail::appendUnsigned(out_, config_.statIntervalMs);
-    out_.append(",\"thread_buffer_bytes\":");
-    detail::appendUnsigned(out_, config_.threadBufferBytes);
-    out_.append(",\"about\":");
-    detail::appendJsonString(out_, kAbout);
-    out_.append("}\n");
+    event_ = "\"lv\":\"info\",\"event\":\"session.start\",\"pid\":";
+    detail::appendSigned(event_, processId());
+    event_.append(",\"exe\":");
+    detail::appendJsonString(event_, pathUtf8(executablePath()));
+    event_.append(",\"part\":");
+    detail::appendUnsigned(event_, part_);
+    event_.append(",\"level\":\"");
+    event_.append(levelName(static_cast<Level>(detail::g_level.load())));
+    event_.append("\",\"stat_interval_ms\":");
+    detail::appendUnsigned(event_, config_.statIntervalMs);
+    event_.append(",\"thread_buffer_bytes\":");
+    detail::appendUnsigned(event_, config_.threadBufferBytes);
+    event_.append(config_.recordTime ? ",\"record_time\":true" : ",\"record_time\":false");
+    event_.append(config_.recordFrame ? ",\"record_frame\":true" : ",\"record_frame\":false");
+    writeEvent(ticks(), event_);
 }
 
 void Backend::writeSessionEnd(bool crashed) {
-    formatter_->appendLineStart(out_, ticks());
-    out_.append(crashed ? ",\"lv\":\"fatal\"" : ",\"lv\":\"info\"");
-    out_.append(",\"event\":\"session.end\",\"crashed\":");
-    out_.append(crashed ? "true" : "false");
-    out_.append(",\"records\":");
-    detail::appendUnsigned(out_, records_);
-    out_.append(",\"dropped\":");
-    detail::appendUnsigned(out_, dropped_);
-    out_.append("}\n");
-}
-
-// 呼んだスレッドの上で、全スレッドの最近の値を写す（裏のスレッドが読むまで待つと、その間に上書きされるため）。
-std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emergency) {
-    std::vector<HistoryCapture> captures;
-    for (auto& entry : Registry::instance().snapshot(emergency)) {
-        entry.buffer->forEachStat([&](StatSlot& slot) {
-            const HistoryRing* ring = slot.history.load(std::memory_order_acquire);
-            if (!ring) {
-                return;
-            }
-            HistoryCapture capture{slot.site.load(std::memory_order_acquire), entry.name, {}};
-            ring->read([&](const HistoryRing::Point& point) {
-                if (point.tick <= untilTick) {  // 頼まれた後の値は含めない
-                    capture.points.push_back(point);
-                }
-            });
-            if (!capture.points.empty()) {
-                captures.push_back(std::move(capture));
-            }
-        });
-    }
-    return captures;
+    event_ = crashed ? "\"lv\":\"fatal\"" : "\"lv\":\"info\"";
+    event_.append(",\"event\":\"session.end\",\"crashed\":");
+    event_.append(crashed ? "true" : "false");
+    event_.append(",\"records\":");
+    detail::appendUnsigned(event_, records_);
+    event_.append(",\"dropped\":");
+    detail::appendUnsigned(event_, dropped_);
+    writeEvent(ticks(), event_);
 }
 
 void Backend::requestDump(std::string_view reason) {
@@ -572,35 +640,32 @@ void Backend::writeHistories(std::string_view reason, std::uint64_t untilTick,
     const double ticksPerMs = clock_->ticksPerNanosecond() * 1.0e6;
     for (const HistoryCapture& capture : captures) {
         const StatSite* site = capture.site;
-        formatter_->appendLineStart(out_, untilTick);
-        out_.append(",\"lv\":\"history\",\"history\":");
-        detail::appendJsonString(out_, site->name);
-        std::string source(detail::sourceFileName(site->file, config_.fullPath));
-        source.push_back(':');
-        detail::appendUnsigned(source, site->line);
-        out_.append(",\"src\":");
-        detail::appendJsonString(out_, source);
-        out_.append(",\"th\":");
-        detail::appendJsonString(out_, capture.thread);
-        out_.append(",\"reason\":");
-        detail::appendJsonString(out_, reason);
-        out_.append(",\"points\":[");
+        event_ = "\"lv\":\"history\",\"history\":";
+        detail::appendJsonString(event_, site->name);
+        event_.append(",\"src\":");
+        detail::appendJsonString(event_, sourceOf(site->file, site->line, config_.fullPath));
+        event_.append(",\"th\":");
+        detail::appendJsonString(event_, capture.thread);
+        event_.append(",\"reason\":");
+        detail::appendJsonString(event_, reason);
+        event_.append(",\"points\":[");
         bool first = true;
         for (const HistoryRing::Point& point : capture.points) {
             if (!first) {
-                out_.push_back(',');
+                event_.push_back(',');
             }
             first = false;
-            out_.push_back('[');
-            detail::appendUnsigned(out_, point.frame);
-            out_.push_back(',');
+            event_.push_back('[');
+            detail::appendUnsigned(event_, point.frame);
+            event_.push_back(',');
             const double before = static_cast<double>(untilTick - point.tick) / ticksPerMs;
-            detail::appendDouble(out_, std::round(before * 1000.0) / 1000.0);
-            out_.push_back(',');
-            detail::appendDouble(out_, point.value);
-            out_.push_back(']');
+            detail::appendDouble(event_, std::round(before * 1000.0) / 1000.0);
+            event_.push_back(',');
+            detail::appendDouble(event_, point.value);
+            event_.push_back(']');
         }
-        out_.append("]}\n");
+        event_.push_back(']');
+        writeEvent(untilTick, event_);
     }
 }
 
@@ -613,15 +678,15 @@ void Backend::emergency(std::string_view reason, const std::string& extraJson) n
     try {
         writeOut();
         // まず落ちたことと場所を書いて、ディスクへ出す（この後の取り出しで落ちても残るように）。
-        formatter_->appendLineStart(out_, ticks());
-        out_.append(",\"lv\":\"fatal\",\"event\":\"crash\",\"reason\":");
-        detail::appendJsonString(out_, reason);
-        out_.append(",\"f\":");
-        detail::appendUnsigned(out_, detail::g_frame.load(std::memory_order_relaxed));
-        out_.append(extraJson);
-        out_.append("}\n");
+        event_ = "\"lv\":\"fatal\",\"event\":\"crash\",\"reason\":";
+        detail::appendJsonString(event_, reason);
+        event_.append(",\"f\":");
+        detail::appendUnsigned(event_, detail::g_frame.load(std::memory_order_relaxed));
+        event_.append(extraJson);
+        writeEvent(ticks(), event_);
         writeOut();
         std::fflush(file_);
+        // 残っている記録はバッファから書き写すだけ（落ちている最中に文字列を作らない）。
         drain(true);
         emitStats(true);
         const std::uint64_t crashTick = ticks();

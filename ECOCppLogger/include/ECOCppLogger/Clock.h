@@ -41,6 +41,8 @@ public:
     double toNanoseconds(double tickDelta) const noexcept { return tickDelta / ticksPerNanosecond_; }
 
     double ticksPerNanosecond() const noexcept { return ticksPerNanosecond_; }
+    std::uint64_t baseTick() const noexcept { return baseTick_; }
+    std::int64_t baseUnixNanoseconds() const noexcept { return baseUnixNanoseconds_; }
 
 private:
     std::uint64_t baseTick_;

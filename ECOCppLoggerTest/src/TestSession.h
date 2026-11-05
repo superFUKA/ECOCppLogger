@@ -6,11 +6,12 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "ECOCppLogger/ECOCppLogger.h"
+#include "ECOCppLogger/Reader.h"
 
 namespace eco::log::test {
 
@@ -29,9 +30,11 @@ inline Config testConfig() {
     return config;
 }
 
-inline std::vector<std::string> readLines(const std::filesystem::path& path) {
+// .ecolog を読んで JSON Lines（LLM 向けの形）にし、1行ずつに分ける。
+inline std::vector<std::string> readLines(const std::filesystem::path& path,
+                                          ViewFormat format = ViewFormat::Json) {
     std::vector<std::string> lines;
-    std::ifstream input(path, std::ios::binary);
+    std::istringstream input(readLog(path, format));
     for (std::string line; std::getline(input, line);) {
         lines.push_back(line);
     }

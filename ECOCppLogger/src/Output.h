@@ -1,13 +1,11 @@
 #pragma once
 
-// 裏のスレッドで、記録を JSON Lines の1行に直す。
+// 記録を文字列にする（見るとき：Reader が使う。動いている間は、標準エラーへ出す設定のときだけ使う）。
 
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
-#include "ECOCppLogger/Clock.h"
 #include "ECOCppLogger/Record.h"
 
 namespace eco::log::detail {
@@ -17,7 +15,7 @@ void appendDouble(std::string& out, double value);
 void appendUnsigned(std::string& out, std::uint64_t value);
 void appendSigned(std::string& out, std::int64_t value);
 
-// UNIX 時刻（ナノ秒）→ "2026-11-05T21:03:04.123456+09:00"（マイクロ秒まで、このPCの時差）。
+// UNIX 時刻（ナノ秒）→ "2026-11-05T21:03:04.123456+09:00"（マイクロ秒まで）。
 void appendTimestamp(std::string& out, std::int64_t unixNanoseconds, int utcOffsetMinutes);
 
 // "void __cdecl Game::Player::update(float)" → "Game::Player::update"
@@ -28,30 +26,51 @@ std::string_view sourceFileName(std::string_view file, bool fullPath) noexcept;
 
 int localUtcOffsetMinutes();
 
+// 書式と、記録の引数のバイト列 → 本文。
+void renderMessage(std::string& out, const Site& site, const std::byte* arguments);
+
+// ticks → 時刻の換算。
+struct TimeBase {
+    std::uint64_t tick = 0;
+    std::int64_t unixNanoseconds = 0;
+    double ticksPerNanosecond = 1.0;
+    int utcOffsetMinutes = 0;
+
+    std::int64_t toUnixNanoseconds(std::uint64_t value) const noexcept {
+        const double delta = static_cast<double>(static_cast<std::int64_t>(value - tick));
+        return unixNanoseconds + static_cast<std::int64_t>(delta / ticksPerNanosecond);
+    }
+};
+
+enum class OutputFormat {
+    Json,  // LLM 向け：JSON Lines
+    Text,  // 人向け：1行の文章
+};
+
 class LineFormatter {
 public:
-    LineFormatter(const Clock& clock, bool fullPath);
+    LineFormatter(OutputFormat format, bool fullPath) : format_(format), fullPath_(fullPath) {}
 
-    // 記録1件 → JSON の1行（改行つき）を out に足す。
-    void appendRecord(std::string& out, const RecordHeader& header, std::string_view threadName);
+    void setTimeBase(const TimeBase& timeBase) {
+        timeBase_ = timeBase;
+        cachedPrefix_.clear();
+    }
+    const TimeBase& timeBase() const noexcept { return timeBase_; }
 
-    // 直前の appendRecord で作った本文（標準エラーへ出すとき用）。
-    std::string_view lastMessage() const noexcept { return message_; }
+    // 記録1件（tick が 0 なら時刻を記録しない設定）→ 1行（改行つき）。
+    void appendRecord(std::string& out, const RecordHeader& header, const Site& site, std::string_view thread);
 
-    // 記録と同じ形の "t" で始まる行の頭："{\"t\":\"…\""
-    void appendLineStart(std::string& out, std::uint64_t tick);
-
-    const Clock& clock() const noexcept { return clock_; }
-    bool fullPath() const noexcept { return fullPath_; }
+    // めったにないもの（集計・最近の値 等）。body は "t" を除く JSON の中身。
+    void appendEvent(std::string& out, std::uint64_t tick, std::string_view body);
 
 private:
-    void renderMessage(const RecordHeader& header);
+    void appendTime(std::string& out, std::uint64_t tick);
 
-    const Clock& clock_;
+    OutputFormat format_;
     bool fullPath_;
-    int utcOffsetMinutes_;
+    TimeBase timeBase_;
     std::string message_;
-    std::unordered_map<const Site*, std::string> siteCache_;
+    std::string source_;
     std::int64_t cachedSecond_ = 0;
     std::string cachedPrefix_;
     std::string cachedSuffix_;

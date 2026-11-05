@@ -235,10 +235,19 @@ void backendThroughput() {
 void writeModes() {
     std::printf("\n[6] 書き出しのタイミング（1フレーム：ログ1000件＋まとめ書き5万件、終わりに writeOut。300フレームの平均）\n");
     constexpr int kFrames = 300;
-    for (auto mode : {eco::log::WriteMode::Interval, eco::log::WriteMode::OnRequest, eco::log::WriteMode::Manual}) {
+    for (int variant = 0; variant < 4; ++variant) {
+        const auto mode = variant == 0   ? eco::log::WriteMode::Interval
+                          : variant == 1 ? eco::log::WriteMode::OnRequest
+                                         : eco::log::WriteMode::Manual;
         eco::log::stop();
         auto config = benchConfig();
         config.writeMode = mode;
+        if (variant == 3) {
+            // 書き出し先を3つに分ける（人向け：Info 以上・まとめ書きなし／ゲーム：型 gameplay だけ／全部）
+            config.destinations = {{.name = "human", .level = Level::Info, .excludeTypes = {"batch", "stat"}},
+                                   {.name = "game", .types = {"gameplay"}},
+                                   {.name = "all"}};
+        }
         eco::log::start(config);
         double total = 0.0;
         double worst = 0.0;
@@ -263,9 +272,10 @@ void writeModes() {
             worst = std::max(worst, ms);
             writeTotal += std::chrono::duration<double, std::milli>(end - beforeWrite).count();
         }
-        const char* name = mode == eco::log::WriteMode::Interval    ? "Interval（2msごとに裏で）"
-                           : mode == eco::log::WriteMode::OnRequest ? "OnRequest（頼んだときに裏で）"
-                                                                     : "Manual（呼んだスレッドで）";
+        const char* name = variant == 0   ? "Interval（2msごとに裏で）"
+                           : variant == 1 ? "OnRequest（頼んだときに裏で）"
+                           : variant == 2 ? "Manual（呼んだスレッドで）"
+                                          : "Manual＋書き出し先3つ";
         std::printf("  %-34s 1フレーム %.3f ms（最大 %.3f ms）、うち writeOut() %.3f ms\n", name, total / kFrames, worst,
                     writeTotal / kFrames);
     }

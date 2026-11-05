@@ -157,6 +157,81 @@ TEST(Logger, ManualWritesOnTheCallingThread) {
     EXPECT_EQ(countContaining(lines, "\"event\":\"session.end\""), 1u);
 }
 
+namespace {
+
+eco::log::Config destinationConfig() {
+    auto config = testConfig();
+    config.destinations = {
+        {.name = "human", .level = Level::Info, .excludeTypes = {"batch", "stat", "history"}},
+        {.name = "game", .types = {"gameplay"}},
+        {.name = "all"},
+    };
+    return config;
+}
+
+void writeMixedLogs() {
+    ECO_LOG_DEBUG("debug detail {}", 1);
+    ECO_LOG_INFO("player joined");
+    ECO_LOG_TYPED("gameplay", Level::Info, "score {}", 100);
+    {
+        ECO_LOG_BATCH(batch, Level::Info, "candidate {}", int);
+        for (int i = 0; i < 1000; ++i) {
+            batch.add(i);
+        }
+    }
+    ECO_STAT("mixed.stat", 3);
+}
+
+}  // namespace
+
+TEST(Logger, DestinationsSplitLogsIntoSeparateFiles) {
+    const auto config = destinationConfig();
+    std::filesystem::path human, game, all;
+    {
+        Session session(config);
+        writeMixedLogs();
+        eco::log::flushStats();
+        human = eco::log::currentFile("human");
+        game = eco::log::currentFile("game");
+        all = eco::log::currentFile("all");
+    }
+    EXPECT_EQ(human.parent_path(), config.directory / "human");
+    EXPECT_EQ(game.parent_path(), config.directory / "game");
+
+    const auto humanLines = readLines(human);
+    EXPECT_EQ(countContaining(humanLines, "player joined"), 1u);
+    EXPECT_EQ(countContaining(humanLines, "score 100"), 1u);
+    EXPECT_EQ(countContaining(humanLines, "debug detail"), 0u);      // 重さで落とす
+    EXPECT_EQ(countContaining(humanLines, "\"batch\":"), 0u);         // まとめ書きは書かない
+    EXPECT_EQ(countContaining(humanLines, "mixed.stat"), 0u);         // 集計も書かない
+    EXPECT_EQ(countContaining(humanLines, "\"event\":\"session.end\""), 1u);  // 始め・終わりはどこにも書く
+
+    const auto gameLines = readLines(game);
+    EXPECT_EQ(countContaining(gameLines, "score 100"), 1u);
+    EXPECT_EQ(countContaining(gameLines, "player joined"), 0u);
+    EXPECT_EQ(countContaining(gameLines, "mixed.stat"), 0u);
+
+    const auto allLines = readLines(all);
+    EXPECT_EQ(countContaining(allLines, "debug detail 1"), 1u);
+    EXPECT_EQ(countContaining(allLines, "\"batch\":1000"), 1u);
+    EXPECT_EQ(countContaining(allLines, "mixed.stat"), 1u);
+
+    // 人向けは小さい
+    EXPECT_LT(std::filesystem::file_size(human) * 4, std::filesystem::file_size(all));
+}
+
+TEST(Logger, ManualWritesEveryDestinationOnTheCallingThread) {
+    auto config = destinationConfig();
+    config.writeMode = eco::log::WriteMode::Manual;
+    Session session(config);
+    writeMixedLogs();
+    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("human")), "player joined"), 0u);
+    eco::log::writeOut();  // 呼んだスレッドで、すべての書き出し先へ
+    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("human")), "player joined"), 1u);
+    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("game")), "score 100"), 1u);
+    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("all")), "\"batch\":1000"), 1u);
+}
+
 TEST(Logger, StartTwiceFails) {
     Session session;
     EXPECT_TRUE(eco::log::isRunning());
@@ -240,6 +315,30 @@ TEST(LoggerDeathTest, ManualModeStillWritesOnCrash) {
     const auto lines = crashLog(config);
     EXPECT_EQ(countContaining(lines, "\"msg\":\"before abort 7\""), 1u);
     EXPECT_EQ(countContaining(lines, "\"event\":\"crash\""), 1u);
+}
+
+TEST(LoggerDeathTest, CrashIsWrittenToEveryDestination) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto config = crashConfig();
+    config.destinations = {{.name = "human", .level = Level::Warn}, {.name = "all"}};
+    std::error_code error;
+    std::filesystem::remove_all(config.directory, error);
+    EXPECT_DEATH(
+        {
+            eco::log::start(config);
+            ECO_LOG_WARN("warn before crash");
+            abortAfterLogging();
+        },
+        "");
+    for (const char* name : {"human", "all"}) {
+        const auto files = logFiles(config.directory / name);
+        ASSERT_EQ(files.size(), 1u) << name;
+        const auto lines = readLines(files.front());
+        EXPECT_EQ(countContaining(lines, "warn before crash"), 1u) << name;
+        EXPECT_EQ(countContaining(lines, "\"event\":\"crash\""), 1u) << name;
+    }
+    EXPECT_EQ(countContaining(readLines(logFiles(config.directory / "human").front()), "before abort 7"), 0u);
+    EXPECT_EQ(countContaining(readLines(logFiles(config.directory / "all").front()), "before abort 7"), 1u);
 }
 
 TEST(LoggerDeathTest, UncaughtExceptionWritesWhat) {

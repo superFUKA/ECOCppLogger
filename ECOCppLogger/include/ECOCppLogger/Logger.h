@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 #include <string_view>
 #include <type_traits>
 
@@ -32,11 +33,29 @@ enum class WriteMode {
     Manual,     // 裏のスレッドを作らない。writeOut() を呼んだスレッドがその場で書き出す（呼んだスレッドの時間を使う）
 };
 
+// 書き出し先：ログを分けて別のファイル（フォルダー）に集める。例：人が読む少ないログ・ゲームのログ・全部のログ。
+// ログを書く側は今までと同じ（1回コピーするだけ）。分けるのは書き出すときで、呼び出し位置ごとに1回だけ判定し、
+// 合う記録を文字列にせずに写す。絞り込みの書き方は ECOCppLoggerView と同じ。
+struct Destination {
+    std::string name;             // directory の下のフォルダー名（空なら directory そのもの）
+    Level level = Level::Trace;   // これより軽いログは書かない
+    // 型で絞る。types が空でなければその型だけ、excludeTypes の型は書かない。
+    // 型を付けないログは "log"、まとめ書きは自分の型に加えて "batch"、集計は "stat"、最近の値は "history"。
+    // 始め・終わり・落ちた・捨てた は、どの書き出し先にも書く。
+    std::vector<std::string> types;
+    std::vector<std::string> excludeTypes;
+};
+
 struct Config {
     // 書き出す先。ファイル名は <stem>_<YYYYMMDD-HHMMSS>_<pid>.ecolog（stem が空なら実行ファイルの名前）。
     // 中身は2進（動いている間は文字列にしない）。見るときは ECOCppLoggerView か eco::log::readLog で文章・JSON にする。
     std::filesystem::path directory = "logs";
     std::string stem;
+
+    // 書き出し先（空なら1つ：絞り込みなしで directory へ）。
+    //   config.destinations = {{.name = "human", .level = Level::Info, .excludeTypes = {"batch", "stat"}},
+    //                          {.name = "all"}};
+    std::vector<Destination> destinations;
 
     Level level = Level::Trace;       // これより軽いログは記録しない（実行中に setLevel で変えられる）
     Level consoleLevel = Level::Off;  // これ以上の重さは標準エラーにも文章で出す（そのぶん裏のスレッドが文字列を作る）
@@ -80,7 +99,8 @@ void flushStats();
 void writeOut();
 
 bool isRunning() noexcept;
-std::filesystem::path currentFile();
+// 今書いているファイル（destination を指定すればその書き出し先の。空なら最初の書き出し先）。
+std::filesystem::path currentFile(std::string_view destination = {});
 
 void setLevel(Level level) noexcept;
 Level level() noexcept;

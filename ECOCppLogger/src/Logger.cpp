@@ -13,7 +13,6 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "CrashHandler.h"
 #include "FileFormat.h"
@@ -68,11 +67,19 @@ std::string pathUtf8(const std::filesystem::path& path) {
     return std::string(reinterpret_cast<const char*>(text.data()), text.size());
 }
 
+std::filesystem::path pathFromUtf8(std::string_view text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
 std::string sourceOf(const char* fileName, std::uint32_t line, bool fullPath) {
     std::string source(detail::sourceFileName(fileName, fullPath));
     source.push_back(':');
     detail::appendUnsigned(source, line);
     return source;
+}
+
+bool listed(const std::vector<std::string>& list, std::string_view name) {
+    return std::find(list.begin(), list.end(), name) != list.end();
 }
 
 struct StatTotal {
@@ -116,17 +123,68 @@ std::vector<HistoryCapture> captureHistories(std::uint64_t untilTick, bool emerg
     return captures;
 }
 
+// めったにない行（Event）の種類。書き出し先・見るときの絞り込みで、型と同じように扱う。
+enum class EventKind { Stat, History, Event };
+
+// 書き出し先1つ分（ファイル・分割・このファイルに書いた呼び出し位置 等）。
+struct Output {
+    Destination destination;
+    std::filesystem::path directory;
+    bool acceptsAll = true;  // 絞り込みなし：リングバッファの中身をそのまま書き写す
+
+    std::FILE* file = nullptr;
+    std::filesystem::path path;
+    std::uint64_t fileBytes = 0;
+    std::uint32_t part = 1;
+    std::deque<std::filesystem::path> files;
+    std::string out;
+    std::string filtered;  // 絞り込んだ記録を並べ直す場所
+
+    // このファイルに書いた呼び出し位置・型・スレッドの名前（ファイルを替えたら書き直す）
+    std::vector<bool> knownSites;
+    std::unordered_map<std::string, std::uint32_t> typeIds;
+    std::unordered_map<std::uint32_t, std::string> knownThreads;
+    std::vector<std::int8_t> accepts;  // 呼び出し位置ごとの判定（0：まだ、1：書く、-1：書かない）
+
+    bool acceptsSite(std::uint32_t id, const Site& site, bool batch) {
+        if (acceptsAll) {
+            return true;
+        }
+        if (accepts.size() <= id) {
+            accepts.resize(id + 1024, 0);
+        }
+        if (accepts[id] == 0) {
+            const std::string_view type = site.type ? site.type : types::Log.name;
+            const bool typeOk =
+                (destination.types.empty() || listed(destination.types, type) || (batch && listed(destination.types, "batch"))) &&
+                !listed(destination.excludeTypes, type) && !(batch && listed(destination.excludeTypes, "batch"));
+            accepts[id] = typeOk && site.level >= destination.level ? 1 : -1;
+        }
+        return accepts[id] > 0;
+    }
+
+    bool acceptsEvent(EventKind kind) const {
+        if (kind == EventKind::Event) {
+            return true;  // 始め・終わり・落ちた・捨てた は、どの書き出し先にも残す
+        }
+        const std::string_view type = kind == EventKind::Stat ? "stat" : "history";
+        return (destination.types.empty() || listed(destination.types, type)) &&
+               !listed(destination.excludeTypes, type) && Level::Info >= destination.level;
+    }
+};
+
 class Backend {
 public:
     bool start(const Config& config);
     void stop();
     void flush(bool stats);
     void wake() noexcept;
+    void writeNow();
     void emergency(std::string_view reason, const std::string& extraJson) noexcept;
     void requestDump(std::string_view reason);
+    std::filesystem::path currentFile(std::string_view destination);
 
     std::atomic<bool> running{false};
-    std::filesystem::path path;
     std::mutex controlMutex;  // start・stop を1つずつ
 
 private:
@@ -138,44 +196,35 @@ private:
 
     void run();
     bool pass(bool stats, bool stopping);
-
-public:
-    void writeNow();
-
-private:
     void drain(bool emergency);
     void emitStats(bool emergency);
     void writeHistories(std::string_view reason, std::uint64_t untilTick, const std::vector<HistoryCapture>& captures);
-    void writeSessionStart();
+    void writeSessionStart(Output& output);
     void writeSessionEnd(bool crashed);
+    void writeConsole(const RecordHeader& header, std::string_view thread);
 
     // ---- ファイルへの書き込み（2進。文字列にするのはめったにない Event の中身だけ） ----
-    bool openFile();
-    void writeOut();
-    void appendFrame(file::FrameType type, std::initializer_list<std::pair<const void*, std::size_t>> parts);
-    void writeClock();
-    void writeSiteDef(std::uint32_t id, const Site& site);
-    void writeEvent(std::uint64_t tick, std::string_view body);
-    void writeConsole(const RecordHeader& header, std::string_view thread);
+    bool openFile(Output& output);
+    void writeOut(Output& output);
+    void writeOutAll();
+    void flushAll(bool close);
+    static void appendFrame(Output& output, file::FrameType type,
+                            std::initializer_list<std::pair<const void*, std::size_t>> parts);
+    void writeClock(Output& output);
+    void writeSiteDef(Output& output, std::uint32_t id, const Site& site);
+    void ensureSite(Output& output, std::uint32_t id);
+    void ensureThread(Output& output, std::uint32_t index, const std::string& name);
+    void writeEvent(EventKind kind, std::uint64_t tick, std::string_view body);
+    void writeEventTo(Output& output, std::uint64_t tick, std::string_view body);
 
     Config config_;
     std::unique_ptr<Clock> clock_;
     std::unique_ptr<detail::LineFormatter> console_;  // consoleLevel が Off でないときだけ
 
     std::timed_mutex io_;  // 取り出し・書き出しの間
-    std::FILE* file_ = nullptr;
-    std::uint64_t fileBytes_ = 0;
-    std::uint32_t part_ = 1;
     std::string baseName_;
-    std::deque<std::filesystem::path> files_;
-    std::string out_;
+    std::vector<std::unique_ptr<Output>> outputs_;
     std::string event_;
-
-    // このファイルに書いた呼び出し位置（番号ごと）・スレッドの名前（ファイルを替えたら書き直す）
-    std::vector<bool> knownSites_;
-    std::uint32_t lastSite_ = 0;
-    std::unordered_map<std::string, std::uint32_t> typeIds_;
-    std::unordered_map<std::uint32_t, std::string> knownThreads_;
 
     std::mutex dumpMutex_;
     std::vector<DumpRequest> dumps_;
@@ -206,30 +255,32 @@ void stopAtExit() {
     backend().stop();
 }
 
-void Backend::appendFrame(file::FrameType type, std::initializer_list<std::pair<const void*, std::size_t>> parts) {
+void Backend::appendFrame(Output& output, file::FrameType type,
+                          std::initializer_list<std::pair<const void*, std::size_t>> parts) {
     std::size_t size = 0;
     for (const auto& part : parts) {
         size += part.second;
     }
     const file::FrameHeader header{type, static_cast<std::uint32_t>(size)};
-    out_.append(reinterpret_cast<const char*>(&header), sizeof(header));
+    output.out.append(reinterpret_cast<const char*>(&header), sizeof(header));
     for (const auto& part : parts) {
-        out_.append(static_cast<const char*>(part.first), part.second);
+        output.out.append(static_cast<const char*>(part.first), part.second);
     }
 }
 
-void Backend::writeClock() {
+void Backend::writeClock(Output& output) {
     const file::ClockPayload payload{clock_->baseTick(), clock_->baseUnixNanoseconds(), clock_->ticksPerNanosecond(),
                                      detail::localUtcOffsetMinutes(), 0};
-    appendFrame(file::FrameType::Clock, {{&payload, sizeof(payload)}});
+    appendFrame(output, file::FrameType::Clock, {{&payload, sizeof(payload)}});
 }
 
-void Backend::writeSiteDef(std::uint32_t id, const Site& site) {
+void Backend::writeSiteDef(Output& output, std::uint32_t id, const Site& site) {
     // 型の名前に、このファイルの中の連番を振る（初めての名前なら TypeDef を先に書く）。
     const std::string_view typeName = site.type ? site.type : types::Log.name;
-    auto [type, inserted] = typeIds_.try_emplace(std::string(typeName), static_cast<std::uint32_t>(typeIds_.size() + 1));
+    auto [type, inserted] =
+        output.typeIds.try_emplace(std::string(typeName), static_cast<std::uint32_t>(output.typeIds.size() + 1));
     if (inserted) {
-        appendFrame(file::FrameType::TypeDef, {{&type->second, 4}, {typeName.data(), typeName.size()}});
+        appendFrame(output, file::FrameType::TypeDef, {{&type->second, 4}, {typeName.data(), typeName.size()}});
     }
     const file::SiteDefPayload payload{id, site.samplingValue, site.line, static_cast<std::uint8_t>(site.level),
                                        site.sampling, site.argCount, 0, type->second, 0};
@@ -238,7 +289,7 @@ void Backend::writeSiteDef(std::uint32_t id, const Site& site) {
     const auto formatLength = static_cast<std::uint32_t>(site.format.size());
     const auto fileLength = static_cast<std::uint32_t>(fileName.size());
     const auto functionLength = static_cast<std::uint32_t>(function.size());
-    appendFrame(file::FrameType::SiteDef,
+    appendFrame(output, file::FrameType::SiteDef,
                 {{&payload, sizeof(payload)},
                  {site.tags, site.argCount},
                  {&formatLength, 4},
@@ -247,66 +298,109 @@ void Backend::writeSiteDef(std::uint32_t id, const Site& site) {
                  {fileName.data(), fileLength},
                  {&functionLength, 4},
                  {function.data(), functionLength}});
-    if (knownSites_.size() <= id) {
-        knownSites_.resize(id + 1024, false);
+    if (output.knownSites.size() <= id) {
+        output.knownSites.resize(id + 1024, false);
     }
-    knownSites_[id] = true;
+    output.knownSites[id] = true;
 }
 
-void Backend::writeEvent(std::uint64_t tick, std::string_view body) {
-    appendFrame(file::FrameType::Event, {{&tick, 8}, {body.data(), body.size()}});
+void Backend::ensureSite(Output& output, std::uint32_t id) {
+    if (id < output.knownSites.size() && output.knownSites[id]) {
+        return;
+    }
+    if (const Site* site = Registry::instance().siteById(id)) {
+        writeSiteDef(output, id, *site);
+    }
 }
 
-bool Backend::openFile() {
+void Backend::ensureThread(Output& output, std::uint32_t index, const std::string& name) {
+    auto known = output.knownThreads.find(index);
+    if (known == output.knownThreads.end() || known->second != name) {
+        appendFrame(output, file::FrameType::ThreadDef, {{&index, 4}, {name.data(), name.size()}});
+        output.knownThreads[index] = name;
+    }
+}
+
+void Backend::writeEventTo(Output& output, std::uint64_t tick, std::string_view body) {
+    appendFrame(output, file::FrameType::Event, {{&tick, 8}, {body.data(), body.size()}});
+}
+
+void Backend::writeEvent(EventKind kind, std::uint64_t tick, std::string_view body) {
+    for (auto& output : outputs_) {
+        if (output->acceptsEvent(kind)) {
+            writeEventTo(*output, tick, body);
+        }
+    }
+}
+
+bool Backend::openFile(Output& output) {
     std::error_code error;
-    std::filesystem::create_directories(config_.directory, error);
+    std::filesystem::create_directories(output.directory, error);
     std::string name = baseName_;
-    if (part_ > 1) {
-        name += "_part" + std::to_string(part_);
+    if (output.part > 1) {
+        name += "_part" + std::to_string(output.part);
     }
     name += ".ecolog";
-    path = config_.directory / std::filesystem::path(std::u8string(name.begin(), name.end()));
+    output.path = output.directory / pathFromUtf8(name);
 #if defined(_WIN32)
-    file_ = _wfsopen(path.c_str(), L"wb", _SH_DENYWR);  // ほかのプログラムが読むのは許す
+    output.file = _wfsopen(output.path.c_str(), L"wb", _SH_DENYWR);  // ほかのプログラムが読むのは許す
 #else
-    file_ = std::fopen(path.c_str(), "wb");
+    output.file = std::fopen(output.path.c_str(), "wb");
 #endif
-    if (!file_) {
+    if (!output.file) {
         return false;
     }
-    std::setvbuf(file_, nullptr, _IOFBF, 1 << 20);
-    fileBytes_ = 0;
-    files_.push_back(path);
-    while (config_.maxFiles > 0 && files_.size() > config_.maxFiles) {
-        std::filesystem::remove(files_.front(), error);
-        files_.pop_front();
+    std::setvbuf(output.file, nullptr, _IOFBF, 1 << 20);
+    output.fileBytes = 0;
+    output.files.push_back(output.path);
+    while (config_.maxFiles > 0 && output.files.size() > config_.maxFiles) {
+        std::filesystem::remove(output.files.front(), error);
+        output.files.pop_front();
     }
-    // ファイルごとに読めるように、頭・時刻の換算・始めの Event を書き、呼び出し位置・スレッドは書き直す。
-    knownSites_.clear();
-    lastSite_ = 0;
-    typeIds_.clear();
-    knownThreads_.clear();
-    out_.append(file::kMagic, sizeof(file::kMagic));
-    out_.append(reinterpret_cast<const char*>(&file::kVersion), sizeof(file::kVersion));
-    writeClock();
-    writeSessionStart();
+    // ファイルごとに読めるように、頭・時刻の換算・始めの Event を書き、呼び出し位置・型・スレッドは書き直す。
+    output.knownSites.clear();
+    output.typeIds.clear();
+    output.knownThreads.clear();
+    output.out.append(file::kMagic, sizeof(file::kMagic));
+    output.out.append(reinterpret_cast<const char*>(&file::kVersion), sizeof(file::kVersion));
+    writeClock(output);
+    writeSessionStart(output);
     return true;
 }
 
-void Backend::writeOut() {
-    if (out_.empty() || !file_) {
-        out_.clear();
+void Backend::writeOut(Output& output) {
+    if (output.out.empty() || !output.file) {
+        output.out.clear();
         return;
     }
-    std::fwrite(out_.data(), 1, out_.size(), file_);
-    fileBytes_ += out_.size();
-    out_.clear();
-    if (config_.maxFileBytes > 0 && fileBytes_ >= config_.maxFileBytes) {
-        std::fclose(file_);
-        file_ = nullptr;
-        ++part_;
-        if (openFile()) {
-            writeOut();
+    std::fwrite(output.out.data(), 1, output.out.size(), output.file);
+    output.fileBytes += output.out.size();
+    output.out.clear();
+    if (config_.maxFileBytes > 0 && output.fileBytes >= config_.maxFileBytes) {
+        std::fclose(output.file);
+        output.file = nullptr;
+        ++output.part;
+        if (openFile(output)) {
+            writeOut(output);
+        }
+    }
+}
+
+void Backend::writeOutAll() {
+    for (auto& output : outputs_) {
+        writeOut(*output);
+    }
+}
+
+void Backend::flushAll(bool close) {
+    for (auto& output : outputs_) {
+        writeOut(*output);
+        if (output->file) {
+            std::fflush(output->file);
+            if (close) {
+                std::fclose(output->file);
+                output->file = nullptr;
+            }
         }
     }
 }
@@ -337,19 +431,31 @@ bool Backend::start(const Config& config) {
     const std::string stamp = started.substr(0, 4) + started.substr(5, 2) + started.substr(8, 2) + "-" +
                               started.substr(11, 2) + started.substr(14, 2) + started.substr(17, 2);
     baseName_ = stem + "_" + stamp + "_" + std::to_string(processId());
-    part_ = 1;
-    files_.clear();
     records_ = 0;
     dropped_ = 0;
+
+    std::vector<Destination> destinations = config_.destinations;
+    if (destinations.empty()) {
+        destinations.push_back({});  // 1つ：絞り込みなしで directory へ
+    }
     {
         std::lock_guard lock(io_);
         crashed_.store(false);
-        if (!openFile()) {
-            out_.clear();
-            return false;
+        outputs_.clear();
+        for (const Destination& destination : destinations) {
+            auto output = std::make_unique<Output>();
+            output->destination = destination;
+            output->directory =
+                destination.name.empty() ? config_.directory : config_.directory / pathFromUtf8(destination.name);
+            output->acceptsAll = destination.level == Level::Trace && destination.types.empty() &&
+                                 destination.excludeTypes.empty();
+            if (!openFile(*output)) {
+                outputs_.clear();
+                return false;
+            }
+            outputs_.push_back(std::move(output));
         }
-        writeOut();
-        std::fflush(file_);
+        flushAll(false);
     }
     lastStatTick_ = ticks();
     lastStatFrame_ = detail::g_frame.load(std::memory_order_relaxed);
@@ -378,6 +484,17 @@ void Backend::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+}
+
+std::filesystem::path Backend::currentFile(std::string_view destination) {
+    std::lock_guard control(controlMutex);
+    std::lock_guard lock(io_);
+    for (auto& output : outputs_) {
+        if (destination.empty() || output->destination.name == destination) {
+            return output->path;
+        }
+    }
+    return {};
 }
 
 void Backend::wake() noexcept {
@@ -413,7 +530,7 @@ bool Backend::pass(bool stats, bool stopping) {
         dumps.swap(dumps_);
     }
     std::lock_guard lock(io_);
-    if (crashed_.load() || !file_) {
+    if (crashed_.load() || outputs_.empty() || !outputs_.front()->file) {
         return false;
     }
     drain(false);
@@ -428,14 +545,7 @@ bool Backend::pass(bool stats, bool stopping) {
         drain(false);
         writeSessionEnd(false);
     }
-    writeOut();
-    if (file_) {
-        std::fflush(file_);
-    }
-    if (stopping && file_) {
-        std::fclose(file_);
-        file_ = nullptr;
-    }
+    flushAll(stopping);  // 止めるときは閉じる（currentFile のために書き出し先は残す）
     return true;
 }
 
@@ -502,31 +612,17 @@ void Backend::writeConsole(const RecordHeader& header, std::string_view thread) 
 }
 
 void Backend::drain(bool emergency) {
-    for (auto& entry : Registry::instance().snapshot(emergency)) {
+    Registry& registry = Registry::instance();
+    for (auto& entry : registry.snapshot(emergency)) {
         ThreadBuffer* buffer = entry.buffer;
         const std::uint32_t index = buffer->index();
-        const bool hasRecords = !buffer->empty();
-        if (hasRecords) {
-            auto known = knownThreads_.find(index);
-            if (known == knownThreads_.end() || known->second != entry.name) {
-                appendFrame(file::FrameType::ThreadDef, {{&index, 4}, {entry.name.data(), entry.name.size()}});
-                knownThreads_[index] = entry.name;
-            }
-        }
         const std::uint64_t drainTick = ticks();
+        const std::uint32_t reserved = 0;
         buffer->consumeSpans([&](const std::byte* data, std::size_t length) {
-            // 初めての呼び出し位置だけ SiteDef を先に書く（ほかは記録の頭を見るだけ）。
+            // 件数を数え、標準エラーへ出す設定なら出す（どちらも記録の頭を見るだけ）。
             for (std::size_t offset = 0; offset < length;) {
                 const auto& header = *reinterpret_cast<const RecordHeader*>(data + offset);
                 if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
-                    if (header.site != lastSite_) {
-                        if (header.site >= knownSites_.size() || !knownSites_[header.site]) {
-                            if (const Site* site = Registry::instance().siteById(header.site)) {
-                                writeSiteDef(header.site, *site);
-                            }
-                        }
-                        lastSite_ = header.site;
-                    }
                     ++records_;
                     if (console_ && header.kind == RecordKind::Log) {
                         writeConsole(header, entry.name);
@@ -534,11 +630,57 @@ void Backend::drain(bool emergency) {
                 }
                 offset += header.size;
             }
-            // リングバッファの中身をそのまま書き写す。
-            const std::uint32_t reserved = 0;
-            appendFrame(file::FrameType::Block, {{&index, 4}, {&reserved, 4}, {&drainTick, 8}, {data, length}});
-            if (out_.size() >= (std::size_t{4} << 20)) {
-                writeOut();
+            for (auto& outputPointer : outputs_) {
+                Output& output = *outputPointer;
+                if (output.acceptsAll) {
+                    // 絞り込みなし：初めての呼び出し位置だけ SiteDef を書き、中身はそのまま書き写す。
+                    std::uint32_t lastSite = 0;
+                    for (std::size_t offset = 0; offset < length;) {
+                        const auto& header = *reinterpret_cast<const RecordHeader*>(data + offset);
+                        if ((header.kind == RecordKind::Log || header.kind == RecordKind::Batch) &&
+                            header.site != lastSite) {
+                            ensureSite(output, header.site);
+                            lastSite = header.site;
+                        }
+                        offset += header.size;
+                    }
+                    ensureThread(output, index, entry.name);
+                    appendFrame(output, file::FrameType::Block,
+                                {{&index, 4}, {&reserved, 4}, {&drainTick, 8}, {data, length}});
+                } else {
+                    // 絞り込みあり：この書き出し先に要る記録（とフレームの印）だけを並べ直す。文字列にはしない。
+                    output.filtered.clear();
+                    bool anyRecord = false;
+                    for (std::size_t offset = 0; offset < length;) {
+                        const auto& header = *reinterpret_cast<const RecordHeader*>(data + offset);
+                        bool keep = header.kind == RecordKind::Frame;
+                        if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
+                            const Site* site = registry.siteById(header.site);
+                            if (site && output.acceptsSite(header.site, *site, header.kind == RecordKind::Batch)) {
+                                ensureSite(output, header.site);
+                                keep = true;
+                                anyRecord = true;
+                            }
+                        }
+                        if (keep) {
+                            output.filtered.append(reinterpret_cast<const char*>(data + offset), header.size);
+                        }
+                        offset += header.size;
+                    }
+                    if (anyRecord) {
+                        ensureThread(output, index, entry.name);
+                    }
+                    if (!output.filtered.empty()) {
+                        appendFrame(output, file::FrameType::Block,
+                                    {{&index, 4},
+                                     {&reserved, 4},
+                                     {&drainTick, 8},
+                                     {output.filtered.data(), output.filtered.size()}});
+                    }
+                }
+                if (output.out.size() >= (std::size_t{4} << 20)) {
+                    writeOut(output);
+                }
             }
         });
         const std::uint64_t dropped = buffer->dropped();
@@ -549,7 +691,7 @@ void Backend::drain(bool emergency) {
             detail::appendUnsigned(event_, dropped - buffer->reportedDropped);
             event_.append(",\"total\":");
             detail::appendUnsigned(event_, dropped);
-            writeEvent(ticks(), event_);
+            writeEvent(EventKind::Event, ticks(), event_);
             dropped_ += dropped - buffer->reportedDropped;
             buffer->reportedDropped = dropped;
         }
@@ -560,7 +702,9 @@ void Backend::emitStats(bool emergency) {
     const std::uint64_t now = ticks();
     const std::uint64_t epoch = detail::g_statEpoch.fetch_add(1, std::memory_order_acq_rel);
     clock_->recalibrate();
-    writeClock();  // 測る区間が長いほど正確になるので、読む側は最後の Clock を使う
+    for (auto& output : outputs_) {
+        writeClock(*output);  // 測る区間が長いほど正確になるので、読む側は最後の Clock を使う
+    }
 
     std::map<std::string_view, StatTotal> totals;  // 名前の順に出す
     std::vector<ThreadBuffer*> finished;
@@ -642,7 +786,7 @@ void Backend::emitStats(bool emergency) {
             event_.append(",\"frames\":");
             detail::appendUnsigned(event_, frame - lastStatFrame_);
         }
-        writeEvent(now, event_);
+        writeEvent(EventKind::Stat, now, event_);
     }
     lastStatTick_ = now;
     lastStatFrame_ = frame;
@@ -651,13 +795,17 @@ void Backend::emitStats(bool emergency) {
     }
 }
 
-void Backend::writeSessionStart() {
+void Backend::writeSessionStart(Output& output) {
     event_ = "\"lv\":\"info\",\"event\":\"session.start\",\"pid\":";
     detail::appendSigned(event_, processId());
     event_.append(",\"exe\":");
     detail::appendJsonString(event_, pathUtf8(executablePath()));
+    if (!output.destination.name.empty()) {
+        event_.append(",\"destination\":");
+        detail::appendJsonString(event_, output.destination.name);
+    }
     event_.append(",\"part\":");
-    detail::appendUnsigned(event_, part_);
+    detail::appendUnsigned(event_, output.part);
     event_.append(",\"level\":\"");
     event_.append(levelName(static_cast<Level>(detail::g_level.load())));
     event_.append("\",\"stat_interval_ms\":");
@@ -666,7 +814,7 @@ void Backend::writeSessionStart() {
     detail::appendUnsigned(event_, config_.threadBufferBytes);
     event_.append(config_.recordTime ? ",\"record_time\":true" : ",\"record_time\":false");
     event_.append(config_.recordFrame ? ",\"record_frame\":true" : ",\"record_frame\":false");
-    writeEvent(ticks(), event_);
+    writeEventTo(output, ticks(), event_);
 }
 
 void Backend::writeSessionEnd(bool crashed) {
@@ -677,7 +825,7 @@ void Backend::writeSessionEnd(bool crashed) {
     detail::appendUnsigned(event_, records_);
     event_.append(",\"dropped\":");
     detail::appendUnsigned(event_, dropped_);
-    writeEvent(ticks(), event_);
+    writeEvent(EventKind::Event, ticks(), event_);
 }
 
 void Backend::requestDump(std::string_view reason) {
@@ -723,37 +871,33 @@ void Backend::writeHistories(std::string_view reason, std::uint64_t untilTick,
             event_.push_back(']');
         }
         event_.push_back(']');
-        writeEvent(untilTick, event_);
+        writeEvent(EventKind::History, untilTick, event_);
     }
 }
 
 void Backend::emergency(std::string_view reason, const std::string& extraJson) noexcept {
-    if (crashed_.exchange(true) || !file_) {
+    if (crashed_.exchange(true) || outputs_.empty()) {
         return;
     }
     // 裏のスレッドが書いている途中なら少し待つ。取れなくても書く（落ちる前に残すことを優先する）。
     const bool locked = io_.try_lock_for(std::chrono::milliseconds(500));
     try {
-        writeOut();
+        writeOutAll();
         // まず落ちたことと場所を書いて、ディスクへ出す（この後の取り出しで落ちても残るように）。
         event_ = "\"lv\":\"fatal\",\"event\":\"crash\",\"reason\":";
         detail::appendJsonString(event_, reason);
         event_.append(",\"f\":");
         detail::appendUnsigned(event_, detail::g_frame.load(std::memory_order_relaxed));
         event_.append(extraJson);
-        writeEvent(ticks(), event_);
-        writeOut();
-        std::fflush(file_);
+        writeEvent(EventKind::Event, ticks(), event_);
+        flushAll(false);
         // 残っている記録はバッファから書き写すだけ（落ちている最中に文字列を作らない）。
         drain(true);
         emitStats(true);
         const std::uint64_t crashTick = ticks();
         writeHistories("crash", crashTick, captureHistories(crashTick, true));
         writeSessionEnd(true);
-        writeOut();
-        if (file_) {
-            std::fflush(file_);
-        }
+        flushAll(false);
     } catch (...) {
     }
     if (locked) {
@@ -802,9 +946,8 @@ bool isRunning() noexcept {
     return backend().running.load();
 }
 
-std::filesystem::path currentFile() {
-    std::lock_guard control(backend().controlMutex);
-    return backend().path;
+std::filesystem::path currentFile(std::string_view destination) {
+    return backend().currentFile(destination);
 }
 
 void setLevel(Level level) noexcept {

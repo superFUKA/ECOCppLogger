@@ -45,11 +45,20 @@ std::string_view eventType(std::string_view body) {
     return "event";
 }
 
+bool listed(const std::vector<std::string>& list, std::string_view name) {
+    return std::find(list.begin(), list.end(), name) != list.end();
+}
+
 bool typeSelected(const ViewFilter& filter, std::string_view type) {
-    const auto contains = [&](const std::vector<std::string>& list) {
-        return std::find(list.begin(), list.end(), type) != list.end();
-    };
-    return (filter.types.empty() || contains(filter.types)) && !contains(filter.excludeTypes);
+    return (filter.types.empty() || listed(filter.types, type)) && !listed(filter.excludeTypes, type);
+}
+
+// 記録の型での判定（書き出し先の絞り込みと同じ：まとめ書きは自分の型に加えて "batch" でもある）。
+bool recordSelected(const ViewFilter& filter, std::string_view type, bool batch) {
+    const bool included =
+        filter.types.empty() || listed(filter.types, type) || (batch && listed(filter.types, "batch"));
+    const bool excluded = listed(filter.excludeTypes, type) || (batch && listed(filter.excludeTypes, "batch"));
+    return included && !excluded;
 }
 
 enum class EntryKind { Record, Batch, Frame, Event };
@@ -176,7 +185,7 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
             } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
                 auto found = sites.find(header.site);
                 if (found != sites.end() && found->second->site.level >= filter.level &&
-                    typeSelected(filter, found->second->type)) {
+                    recordSelected(filter, found->second->type, header.kind == RecordKind::Batch)) {
                     entries.push_back(Entry{order, view.tick,
                                             header.kind == RecordKind::Log ? EntryKind::Record : EntryKind::Batch,
                                             thread, found->second.get(), std::move(record), {}});

@@ -1,0 +1,96 @@
+#pragma once
+
+// 書き出し：すべてのスレッドのバッファを、呼んだスレッドで .ecolog へ書き写す（裏のスレッドはない）。
+// 書き出し先（Destination）ごとにファイルを持ち、呼び出し位置ごとに1回判定して、合う記録だけを写す。
+
+#include <stdint.h>
+#include <stdio.h>
+
+#include <deque>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include "ECOCppLogger/Clock.h"
+#include "ECOCppLogger/Config.h"
+#include "FileFormat.h"
+#include "Format.h"
+
+namespace lg::detail {
+
+// めったにない行（Event）の種類。書き出し先・見るときの絞り込みで、型と同じように扱う。
+enum class EventKind { Stat, History, Event };
+
+class Writer {
+public:
+    bool start(const Config& config);
+    void stop();
+    void writeOut();
+    bool running() const noexcept { return running_; }
+    const char* currentFile(const char* destination);
+
+    // めったにない行を書き出し先へ（集計・最近の値 等は後の工程で使う）。io の中で呼ぶ。
+    void writeEvent(EventKind kind, uint64_t tick, std::string_view body);
+
+private:
+    struct Output {
+        std::string name;
+        Level level = Level::Trace;
+        std::vector<std::string> types;
+        std::vector<std::string> excludeTypes;
+        bool acceptsAll = true;  // 絞り込みなし：バッファの中身をそのまま書き写す
+
+        std::filesystem::path directory;
+        FILE* file = nullptr;
+        std::filesystem::path path;
+        std::string pathUtf8;
+        uint64_t fileBytes = 0;
+        uint32_t part = 1;
+        std::deque<std::filesystem::path> files;
+        std::string out;
+        std::string filtered;
+
+        // このファイルに書いた呼び出し位置・型・スレッド（ファイルを替えたら書き直す）
+        std::vector<bool> knownSites;
+        std::unordered_map<std::string, uint32_t> typeIds;
+        std::unordered_map<uint32_t, std::string> knownThreads;
+        std::vector<int8_t> accepts;  // 呼び出し位置ごとの判定（0：まだ、1：書く、-1：書かない）
+
+        bool acceptsSite(uint32_t id, const Site& site, bool batch);
+        bool acceptsEvent(EventKind kind) const;
+    };
+
+    bool openFile(Output& output);
+    void writeOutFile(Output& output);
+    void flushAll(bool close);
+    static void appendFrame(Output& output, file::FrameType type,
+                            std::initializer_list<std::pair<const void*, size_t>> parts);
+    void writeClock(Output& output);
+    void ensureSite(Output& output, uint32_t id);
+    void ensureThread(Output& output, uint32_t index, uint64_t osThreadId, const std::string& name);
+    void writeEventTo(Output& output, uint64_t tick, std::string_view body);
+    void writeSessionStart(Output& output);
+    void writeSessionEnd(bool crashed);
+    void drain(bool emergency);
+    void writeConsole(const RecordHeader& header, std::string_view thread);
+
+    std::mutex io_;
+    bool running_ = false;
+    Config config_;
+    std::string directory_;
+    std::string baseName_;
+    std::unique_ptr<Clock> clock_;
+    std::unique_ptr<LineFormatter> console_;
+    std::vector<std::unique_ptr<Output>> outputs_;
+    std::string event_;
+    uint64_t records_ = 0;
+    uint64_t dropped_ = 0;
+};
+
+Writer& writer();
+
+}  // namespace lg::detail

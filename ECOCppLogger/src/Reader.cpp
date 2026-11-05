@@ -276,8 +276,8 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
                 if (firstRecord) {
                     firstRecord = false;
                     for (std::string& body : pendingThreadLines) {
-                        if (typeSelected("event", false)) {
-                            entries.push_back(Entry{order, 0, EntryKind::Event, 0, nullptr, {}, std::move(body)});
+                        if (level <= Level::Info && typeSelected("event", false)) {
+                            entries.push_back(Entry{order, view.tick, EntryKind::Event, 0, nullptr, {}, std::move(body)});
                         }
                     }
                     pendingThreadLines.clear();

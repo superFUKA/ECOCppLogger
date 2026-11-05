@@ -57,10 +57,11 @@ std::string readableTypeName(std::string_view name) {
         }
         return out;
     }
-    for (std::string_view prefix : {"class ", "struct "}) {
-        if (name.starts_with(prefix)) name.remove_prefix(prefix.size());
+    std::string out(name);
+    for (std::string_view word : {"class ", "struct "}) {  // "class std::_With_nested_v2<class std::logic_error>"
+        for (size_t at = out.find(word); at != std::string::npos; at = out.find(word, at)) out.erase(at, word.size());
     }
-    return std::string(name);
+    return out;
 }
 
 // 例外の連なり（std::throw_with_nested で包んだもの）を、外から順に [{"type":…,"what":…},…] にする。

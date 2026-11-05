@@ -367,7 +367,10 @@ std::string_view shortFunctionName(std::string_view function) noexcept {
         else if (c == '>' && depth > 0) --depth;
         else if (c == ' ' && depth == 0) begin = i + 1;
     }
-    return function.substr(begin, end - begin);
+    std::string_view name = function.substr(begin, end - begin);
+    constexpr std::string_view kAnonymous = "`anonymous-namespace'::";  // MSVC の無名の名前空間は省く
+    if (name.starts_with(kAnonymous)) name.remove_prefix(kAnonymous.size());
+    return name;
 }
 
 std::string_view sourceFileName(std::string_view file, bool fullPath) noexcept {

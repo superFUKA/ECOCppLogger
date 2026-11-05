@@ -1,0 +1,27 @@
+{
+  "data": {
+    "dependencies": {
+      "6a6f13c2b49d4788b7c62b60aacbce03": {
+        "kind": "project",
+        "values": {
+          "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
+          "project_type": "static_library"
+        }
+      }
+    },
+    "guid": "2a15a8e9-88c9-437e-87b7-5a85f4e52085",
+    "initial_type": "executable",
+    "name": "ECOCppLoggerBench",
+    "project_headers": [],
+    "source_directories": [
+      "src",
+      "include"
+    ],
+    "system_headers": [],
+    "types": {
+      "executable": "executable-8848ded3be73bc6bd820244b1cec0b6b459348f6dbd4e312ad6f2805afd0666b.json"
+    }
+  },
+  "kind": "project",
+  "schema_version": 5
+}

@@ -4,3 +4,4 @@
 
 # CppBuildの中間ファイル・成果物
 /.ecobuild/.cppbuild/output/
+/.ecobuild/.cppbuild/operations/

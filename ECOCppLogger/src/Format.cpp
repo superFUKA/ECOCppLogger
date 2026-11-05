@@ -125,8 +125,31 @@ void appendFormattedDouble(std::string& out, double value, const Spec& spec) {
 }
 
 // 引数1つ：本文へ書式どおりに、JSON へは値として。
-void appendArgument(std::string& message, std::string* json, ArgTag tag, const unsigned char*& cursor,
-                    const Spec& spec) {
+// 引数の形を読み進める位置（ECO_LOG_FIELDS の型は形が複数続く）。
+struct ArgCursor {
+    const ArgTag* tag;
+    const unsigned char* data;
+    const char* const* structNames;
+    uint32_t structLeft;
+};
+
+std::string_view trimmed(std::string_view text) {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
+    return text;
+}
+
+template <class T>
+void appendSignedArg(std::string& message, std::string* json, T value, const Spec& spec) {
+    const auto wide = static_cast<int64_t>(value);
+    const uint64_t magnitude = wide < 0 ? 0 - static_cast<uint64_t>(wide) : static_cast<uint64_t>(wide);
+    appendFormattedInteger(message, magnitude, wide < 0, spec);
+    if (json) appendSigned(*json, wide);
+}
+
+void appendArgument(std::string& message, std::string* json, ArgCursor& args, const Spec& spec) {
+    const ArgTag tag = *args.tag++;
+    const unsigned char*& cursor = args.data;
     switch (tag) {
     case ArgTag::Bool: {
         const bool value = readValue<bool>(cursor);
@@ -140,11 +163,24 @@ void appendArgument(std::string& message, std::string* json, ArgTag tag, const u
         if (json) appendJsonString(*json, std::string_view(&value, 1));
         break;
     }
-    case ArgTag::Int: {
-        const auto value = readValue<int64_t>(cursor);
-        const uint64_t magnitude = value < 0 ? 0 - static_cast<uint64_t>(value) : static_cast<uint64_t>(value);
-        appendFormattedInteger(message, magnitude, value < 0, spec);
-        if (json) appendSigned(*json, value);
+    case ArgTag::Int: appendSignedArg(message, json, readValue<int64_t>(cursor), spec); break;
+    case ArgTag::Int8: appendSignedArg(message, json, readValue<int8_t>(cursor), spec); break;
+    case ArgTag::Int16: appendSignedArg(message, json, readValue<int16_t>(cursor), spec); break;
+    case ArgTag::Int32: appendSignedArg(message, json, readValue<int32_t>(cursor), spec); break;
+    case ArgTag::UInt8:
+    case ArgTag::UInt16:
+    case ArgTag::UInt32: {
+        const uint64_t value = tag == ArgTag::UInt8    ? readValue<uint8_t>(cursor)
+                               : tag == ArgTag::UInt16 ? readValue<uint16_t>(cursor)
+                                                       : readValue<uint32_t>(cursor);
+        appendFormattedInteger(message, value, false, spec);
+        if (json) appendUnsigned(*json, value);
+        break;
+    }
+    case ArgTag::Float: {
+        const auto value = static_cast<double>(readValue<float>(cursor));
+        appendFormattedDouble(message, value, spec);
+        if (json) appendDouble(*json, value);
         break;
     }
     case ArgTag::UInt: {
@@ -177,7 +213,36 @@ void appendArgument(std::string& message, std::string* json, ArgTag tag, const u
         if (json) appendJsonString(*json, std::string_view(buffer, static_cast<size_t>(result.ptr - buffer)));
         break;
     }
-    default: break;  // 元の大きさの型はまとめ書きだけで使う
+    case ArgTag::Struct: {  // {x=1, y=2}、JSON では {"x":1,"y":2}
+        const auto fields = static_cast<uint32_t>(*args.tag++);
+        std::string_view names;
+        if (args.structLeft > 0) {
+            names = *args.structNames++;
+            --args.structLeft;
+        }
+        message.push_back('{');
+        if (json) json->push_back('{');
+        for (uint32_t i = 0; i < fields; ++i) {
+            const size_t comma = names.find(',');
+            const std::string_view name = trimmed(names.substr(0, comma));
+            names = comma == std::string_view::npos ? std::string_view() : names.substr(comma + 1);
+            if (i != 0) {
+                message.append(", ");
+                if (json) json->push_back(',');
+            }
+            message.append(name);
+            message.push_back('=');
+            if (json) {
+                appendJsonString(*json, name);
+                json->push_back(':');
+            }
+            appendArgument(message, json, args, spec);
+        }
+        message.push_back('}');
+        if (json) json->push_back('}');
+        break;
+    }
+    default: break;
     }
 }
 
@@ -329,7 +394,9 @@ int localUtcOffsetMinutes() {
     return static_cast<int>(std::difftime(std::mktime(&local), std::mktime(&utc)) / 60.0);
 }
 
-void renderMessage(std::string& message, std::string* argsJson, const Site& site, const unsigned char* cursor) {
+const unsigned char* renderMessage(std::string& message, std::string* argsJson, const Site& site,
+                                   const unsigned char* cursor) {
+    ArgCursor args{site.tags, cursor, site.structNames, site.structCount};
     const std::string_view format = site.format;
     std::string values;  // 名前付きの値の JSON（"名前":値,…）
     size_t argument = 0;
@@ -360,7 +427,8 @@ void renderMessage(std::string& message, std::string* argsJson, const Site& site
             values.push_back(':');
             json = &values;
         }
-        appendArgument(message, json, site.tags[argument++], cursor, spec);
+        appendArgument(message, json, args, spec);
+        ++argument;
         i = close;
     }
     if (argsJson && !values.empty()) {
@@ -368,6 +436,7 @@ void renderMessage(std::string& message, std::string* argsJson, const Site& site
         argsJson->append(values);
         argsJson->push_back('}');
     }
+    return args.data;
 }
 
 // ---- 1行 ----------------------------------------------------------------------------------------------
@@ -516,6 +585,75 @@ void LineFormatter::appendRecord(std::string& out, uint64_t tick, uint64_t frame
         appendUnsigned(out, aux);
         break;
     case Sampling::None: break;
+    }
+    out.append("}\n");
+}
+
+void LineFormatter::appendBatch(std::string& out, uint64_t tick, uint64_t frame, const Site& site,
+                                const unsigned char* payload, size_t payloadSize, std::string_view thread,
+                                uint32_t maxRows) {
+    BatchInfo info{};
+    if (payloadSize < sizeof(info)) return;
+    memcpy(&info, payload, sizeof(info));
+    const unsigned char* cursor = payload + sizeof(info);
+    const size_t available = (payloadSize - sizeof(info)) / (info.elementSize ? info.elementSize : 1);
+    const uint32_t count = static_cast<uint32_t>(std::min<size_t>(info.count, available));
+    const uint32_t shown = maxRows != 0 && maxRows < count ? maxRows : count;
+    const bool timed = tick != 0 && info.endTick >= tick;
+    const double microseconds =
+        timed ? static_cast<double>(info.endTick - tick) / timeBase_.ticksPerNanosecond / 1000.0 : 0.0;
+
+    if (format_ == OutputFormat::Text) {
+        appendTextPrefix(out, tick, frame, site, thread);
+        out.append("[batch ");
+        appendUnsigned(out, info.count);
+        out.append(" rows");
+        if (timed) {
+            out.append(", ");
+            appendFormattedDouble(out, microseconds, Spec{false, 0, 1, 0});
+            out.append("us");
+        }
+        out.append("] ");
+        out.append(site.format);
+        out.push_back('\n');
+        for (uint32_t i = 0; i < shown; ++i) {
+            out.append("    ");
+            cursor = renderMessage(out, nullptr, site, cursor);
+            out.push_back('\n');
+        }
+        if (shown < count) {
+            out.append("    ... ");
+            appendUnsigned(out, count - shown);
+            out.append(" more rows\n");
+        }
+        return;
+    }
+
+    appendJsonPrefix(out, tick, frame, site, thread);
+    out.append(",\"msg\":");
+    appendJsonString(out, site.format);
+    out.append(",\"batch\":");
+    appendUnsigned(out, info.count);
+    if (timed) {
+        out.append(",\"us\":");
+        appendDouble(out, std::round(microseconds * 10.0) / 10.0);
+    }
+    out.append(",\"rows\":[");
+    for (uint32_t i = 0; i < shown; ++i) {
+        if (i != 0) out.push_back(',');
+        message_.clear();
+        args_.clear();
+        cursor = renderMessage(message_, &args_, site, cursor);
+        if (!args_.empty()) {
+            out.append(args_);  // 名前付きの値があれば {"名前":値,…}
+        } else {
+            appendJsonString(out, message_);
+        }
+    }
+    out.push_back(']');
+    if (shown < count) {
+        out.append(",\"omitted\":");
+        appendUnsigned(out, count - shown);
     }
     out.append("}\n");
 }

@@ -24,6 +24,15 @@ TEST(Disabled, MacrosLeaveNoCode) {
     ECO_LOG_INFO("disabled {}", sideEffect());
     ECO_LOG(Warn | Physics, "disabled typed {}", sideEffect());
     ECO_FRAME();
+    ECO_LOG_IF(Info, sideEffect() > 0, "if {}", sideEffect());
+    ECO_LOG_EVERY_N(Info, 2, "every {}", sideEffect());
+    ECO_LOG_FIRST_N(Info, 2, "first {}", sideEffect());
+    ECO_LOG_ONCE(Info, "once {}", sideEffect());
+    ECO_LOG_EVERY_MS(Info, 10, "ms {}", sideEffect());
+    ECO_LOG_ON_CHANGE(Info, "value", sideEffect());
+    ECO_LOG_BATCH(batch, Info, "disabled batch {}", int);
+    batch.add(1);
+    EXPECT_FALSE(batch.enabled());
     EXPECT_EQ(g_evaluated, 0);  // 引数も評価しない
     EXPECT_EQ(lgtest::countContaining(session.lines(), "disabled"), 0u);
 }

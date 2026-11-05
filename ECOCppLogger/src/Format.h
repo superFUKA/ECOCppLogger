@@ -28,7 +28,9 @@ std::string_view sourceFileName(std::string_view file, bool fullPath) noexcept;
 int localUtcOffsetMinutes();
 
 // 書式と引数のバイト列 → 本文。argsJson を渡すと、名前付きの値があれば {"名前":値,…} を足す（なければ空のまま）。
-void renderMessage(std::string& message, std::string* argsJson, const Site& site, const unsigned char* arguments);
+// 戻り値は読み終えた位置（まとめ書きで次の1件へ進むのに使う）。
+const unsigned char* renderMessage(std::string& message, std::string* argsJson, const Site& site,
+                                   const unsigned char* arguments);
 
 // ticks → 時刻の換算。
 struct TimeBase {
@@ -61,6 +63,10 @@ public:
     // ログ1件（tick が 0 なら時刻なし、frame が 0 ならフレームなし）→ 1行（改行つき）。
     void appendRecord(std::string& out, uint64_t tick, uint64_t frame, uint64_t aux, const Site& site,
                       const unsigned char* arguments, std::string_view thread);
+
+    // まとめ書きの塊1件（payload は BatchInfo から）。maxRows が 0 でなければ、その件数まで。
+    void appendBatch(std::string& out, uint64_t tick, uint64_t frame, const Site& site, const unsigned char* payload,
+                     size_t payloadSize, std::string_view thread, uint32_t maxRows);
 
     // めったにないもの（集計・始め・終わり 等）。body は "t" を除く JSON の中身（"lv":"…",…）。
     void appendEvent(std::string& out, uint64_t tick, std::string_view body);

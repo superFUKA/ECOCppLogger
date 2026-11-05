@@ -24,6 +24,7 @@ constexpr std::string_view kAbout =
     "type=kind of log given by the program (missing means a plain log), th=thread, src=file:line, fn=function, "
     "msg=message, args=named values of the message. sample=this site is sampled (n=call count, skipped=calls not "
     "logged since the previous line, on change=written only when the value changed, change=0 is the first value). "
+    "batch=a loop logged in one block (rows=values of each iteration, us=time the block took, omitted=rows not shown). "
     "event=dropped means the thread's buffer was full and that many records were lost. event=crash has the reason, "
     "exception and stack.";
 
@@ -34,6 +35,8 @@ struct OwnedSite {
     std::string function;
     std::string type;
     std::vector<ArgTag> tags;
+    std::vector<std::string> structNames;
+    std::vector<const char*> structNamePointers;
 };
 
 enum class EntryKind { Record, Batch, Frame, Event };
@@ -163,14 +166,20 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
     case file::FrameType::SiteDef: {
         if (size < sizeof(file::SiteDefPayload)) return;
         const auto payload = readAt<file::SiteDefPayload>(cursor);
-        if (static_cast<size_t>(end - cursor) < payload.argCount) return;
+        if (static_cast<size_t>(end - cursor) < payload.tagCount) return;
         auto owned = std::make_unique<OwnedSite>();
         owned->tags.assign(reinterpret_cast<const ArgTag*>(cursor),
-                           reinterpret_cast<const ArgTag*>(cursor) + payload.argCount);
-        cursor += payload.argCount;
+                           reinterpret_cast<const ArgTag*>(cursor) + payload.tagCount);
+        cursor += payload.tagCount;
         owned->format = readString(cursor, end);
         owned->fileName = readString(cursor, end);
         owned->function = readString(cursor, end);
+        for (uint32_t i = 0; i < payload.structCount; ++i) {
+            owned->structNames.push_back(readString(cursor, end));
+        }
+        for (const std::string& names : owned->structNames) {
+            owned->structNamePointers.push_back(names.c_str());
+        }
         auto typeName = typeNames.find(payload.type);
         owned->type = typeName != typeNames.end() ? typeName->second : std::string(types::Log.name);
         owned->tags.push_back(ArgTag::None);
@@ -183,7 +192,10 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
                            owned->tags.data(),
                            payload.argCount,
                            static_cast<Sampling>(payload.sampling),
-                           payload.samplingValue};
+                           payload.samplingValue,
+                           payload.tagCount,
+                           owned->structNamePointers.data(),
+                           static_cast<uint8_t>(owned->structNamePointers.size())};
         sites[payload.id] = std::move(owned);
         return;
     }
@@ -307,6 +319,10 @@ const char* LogReader::take(size_t& size) {
             if (entry.kind == EntryKind::Record) {
                 s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, entry.site->site, view.payload,
                                          thread);
+            } else {
+                const size_t used = static_cast<size_t>(view.payload - reinterpret_cast<const unsigned char*>(header));
+                s.formatter.appendBatch(line, view.tick, s.currentFrame, entry.site->site, view.payload,
+                                        header->size > used ? header->size - used : 0, thread, s.batchRows);
             }
         }
         if (!s.contains.empty() && line.find(s.contains) == std::string::npos) continue;

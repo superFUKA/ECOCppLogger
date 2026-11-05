@@ -69,6 +69,23 @@ public:
         dropped_.store(dropped_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
+    // 呼び出し位置ごと・スレッドごとの小さな状態（EVERY_N の回数・ON_CHANGE の前の値）。持ち主のスレッドだけが使う。
+    // 共有の atomic で数えると、スレッド間でキャッシュラインを取り合う（研究の測定：約 6ns → 約 1.3ns）。
+    struct SiteState {
+        uint64_t value;
+        uint64_t count;
+    };
+    static constexpr uint32_t kStateChunkSize = 1024;
+    static constexpr uint32_t kStateChunks = 1024;
+
+    SiteState& siteState(uint32_t site) noexcept {
+        SiteState* chunk = stateChunks_[(site / kStateChunkSize) % kStateChunks];
+        if (!chunk) [[unlikely]] {
+            chunk = createStateChunk(site);
+        }
+        return chunk[site % kStateChunkSize];
+    }
+
     // ---- 書き出す側が使う ------------------------------------------------------------------------------
 
     // まだ読んでいない部分を、続いているバイト列ごとに callback(data, size) に渡す（多くて2回：終わりで折り返すため）。
@@ -104,6 +121,10 @@ public:
     std::atomic<bool> retired{false};  // スレッドが終わった（読み切ったら片付ける）
 
 private:
+    SiteState* createStateChunk(uint32_t site) noexcept;
+
+    SiteState* stateChunks_[kStateChunks] = {};
+
     // 持ち主のスレッドが書く側
     alignas(64) std::atomic<uint64_t> write_{0};
     uint64_t localWrite_ = 0;

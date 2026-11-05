@@ -25,6 +25,19 @@ ThreadBuffer::ThreadBuffer(size_t capacityBytes, uint32_t reservePercent, uint32
 
 ThreadBuffer::~ThreadBuffer() {
     ::operator delete(data_, std::align_val_t{64});
+    for (SiteState* chunk : stateChunks_) {
+        delete[] chunk;
+    }
+}
+
+ThreadBuffer::SiteState* ThreadBuffer::createStateChunk(uint32_t site) noexcept {
+    SiteState*& chunk = stateChunks_[(site / kStateChunkSize) % kStateChunks];
+    chunk = new (std::nothrow) SiteState[kStateChunkSize]();
+    if (!chunk) {
+        static thread_local SiteState fallback[kStateChunkSize];  // 取れなければ使い捨て（間引きが不正確になるだけ）
+        return fallback;
+    }
+    return chunk;
 }
 
 namespace detail {

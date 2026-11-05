@@ -146,6 +146,9 @@ void Writer::ensureSite(Output& output, uint32_t id) {
                                        static_cast<uint8_t>(site->level),
                                        static_cast<uint8_t>(site->sampling),
                                        site->argCount,
+                                       site->structCount,
+                                       site->tagCount,
+                                       0,
                                        0};
     const std::string_view format = site->format;
     const std::string_view fileName = site->file;
@@ -153,15 +156,23 @@ void Writer::ensureSite(Output& output, uint32_t id) {
     const auto formatLength = static_cast<uint32_t>(format.size());
     const auto fileLength = static_cast<uint32_t>(fileName.size());
     const auto functionLength = static_cast<uint32_t>(function.size());
+    std::string structNames;  // ECO_LOG_FIELDS の型の項目名（uint32 の長さ＋バイト列 を個数ぶん）
+    for (uint32_t i = 0; i < site->structCount; ++i) {
+        const std::string_view names = site->structNames[i] ? site->structNames[i] : "";
+        const auto length = static_cast<uint32_t>(names.size());
+        structNames.append(reinterpret_cast<const char*>(&length), 4);
+        structNames.append(names);
+    }
     appendFrame(output, file::FrameType::SiteDef,
                 {{&payload, sizeof(payload)},
-                 {site->tags, site->argCount},
+                 {site->tags, site->tagCount},
                  {&formatLength, 4},
                  {format.data(), formatLength},
                  {&fileLength, 4},
                  {fileName.data(), fileLength},
                  {&functionLength, 4},
-                 {function.data(), functionLength}});
+                 {function.data(), functionLength},
+                 {structNames.data(), structNames.size()}});
     if (output.knownSites.size() <= id) {
         output.knownSites.resize(id + 1024, false);
     }

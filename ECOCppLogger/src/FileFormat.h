@@ -46,7 +46,8 @@ struct ClockPayload {
 
 // TypeDef の中身：uint32 の番号＋名前のバイト列
 
-// SiteDef の中身：SiteDefPayload、引数の形（argCount バイト）、書式・ファイル・関数（それぞれ uint32 の長さ＋バイト列）
+// SiteDef の中身：SiteDefPayload、引数の形（tagCount バイト）、書式・ファイル・関数、
+// ECO_LOG_FIELDS の型の項目名（structCount 個）（文字列はそれぞれ uint32 の長さ＋バイト列）
 struct SiteDefPayload {
     uint32_t id;
     uint32_t line;
@@ -55,7 +56,10 @@ struct SiteDefPayload {
     uint8_t level;
     uint8_t sampling;
     uint8_t argCount;
-    uint8_t reserved;
+    uint8_t structCount;
+    uint16_t tagCount;
+    uint16_t reserved;
+    uint32_t reserved2;
 };
 
 // ThreadDef の中身：ThreadDefPayload＋名前のバイト列

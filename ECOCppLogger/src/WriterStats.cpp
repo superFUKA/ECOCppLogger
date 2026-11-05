@@ -165,16 +165,21 @@ void Writer::dumpHistory(std::string_view reason) {
             });
             body.append("],\"src\":");
             appendSource(body, *site);
-            pendingHistory_.emplace_back(now, std::move(body));
+            pending_.push_back({EventKind::History, now, std::move(body)});
         });
     }
 }
 
+void Writer::queueEvent(EventKind kind, uint64_t tick, std::string body) {
+    std::lock_guard lock(io_);
+    pending_.push_back({kind, tick, std::move(body)});
+}
+
 void Writer::writePending() {
-    for (const auto& [tick, body] : pendingHistory_) {
-        writeEvent(EventKind::History, tick, body);
+    for (const PendingEvent& event : pending_) {
+        writeEvent(event.kind, event.tick, event.body);
     }
-    pendingHistory_.clear();
+    pending_.clear();
 }
 
 }  // namespace lg::detail

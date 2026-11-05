@@ -18,6 +18,7 @@
 #include <source_location>
 #include <tuple>
 
+#include "ECOCppLogger/Assert.h"
 #include "ECOCppLogger/Logger.h"
 
 // ---- 有効・無効（ファイルの先頭・プロジェクトの設定で） -------------------------------------------------------
@@ -358,6 +359,65 @@
 #define ECO_STAT_HISTORY(...) ((void)0)
 
 #endif  // ECO_LOG_STATS
+
+// ---- アサート：条件が偽なら、ログ（Error・型 assert）・最近の値・スタックを残して、決めた動き（Config::assertAction）をする ----
+//
+//   ECO_ASSERT(hp >= 0);                                  // 止める・落とす・続ける（Config::assertAction）
+//   ECO_ASSERT(index < size, "index={index} size={size}", index, size);
+//   if (!ECO_CHECK(texture != nullptr, "missing {name}", name)) return;   // 式。書くだけで止めない
+//   ECO_VERIFY(file.close());                             // ECO_LOG_ASSERTS=0 でも式は評価する
+//
+// 同じ場所の失敗は最初の10回だけ詳しく書き、その後は集計 "assert: 条件" で数だけ数える。
+// ECO_LOG_ASSERTS=0 で消える（既定は ECO_LOG_ENABLE と同じ。ECO_CHECK は条件だけを返す）。
+
+#ifndef ECO_LOG_ASSERTS
+#define ECO_LOG_ASSERTS ECO_LOG_ENABLE
+#endif
+
+#if ECO_LOG_ASSERTS
+
+// 失敗したとき（ブロックの中で使う）。
+#define ECO_LOG_ASSERT_FAILED_(action_, text_, fmt_, ...)                                                       \
+    static constexpr ::lg::SiteOptions eco_log_opt_{::lg::Level::Error, ::lg::types::Assert.name};              \
+    static constexpr auto eco_assert_format_ = ::lg::detail::assertFormat(text_, fmt_);                         \
+    using eco_log_tags_ = decltype(::lg::detail::tagList(__VA_ARGS__));                                         \
+    ECO_LOG_DEFINE_SITE_(::lg::Sampling::FirstN, ::lg::detail::kAssertDetailed, eco_assert_format_.data());     \
+    static constinit ::lg::detail::FirstCounter eco_assert_counter_;                                            \
+    const ::uint64_t eco_assert_n_ = eco_assert_counter_.passes.fetch_add(1, ::std::memory_order_relaxed) + 1;  \
+    ECO_STAT_COUNT("assert: " text_);                                                                           \
+    if (eco_assert_n_ <= ::lg::detail::kAssertDetailed) {                                                       \
+        ::lg::detail::SampledEmitter{eco_log_site_, eco_log_id_, eco_assert_n_}(__VA_ARGS__);                   \
+    }                                                                                                           \
+    if (::lg::detail::assertFailed(eco_log_site_, eco_assert_n_, (action_))) ::lg::detail::debugBreak()
+
+#define ECO_LOG_ASSERT_IMPL_(cond_, text_, fmt_, ...)                              \
+    do {                                                                           \
+        if (!(cond_)) [[unlikely]] {                                               \
+            ECO_LOG_ASSERT_FAILED_(true, text_, fmt_, __VA_ARGS__);                \
+        }                                                                          \
+    } while (false)
+
+#define ECO_LOG_CHECK_IMPL_(cond_, text_, fmt_, ...)                               \
+    ([&]() -> bool {                                                               \
+        if (cond_) [[likely]] {                                                    \
+            return true;                                                           \
+        }                                                                          \
+        ECO_LOG_ASSERT_FAILED_(false, text_, fmt_, __VA_ARGS__);                   \
+        return false;                                                              \
+    }())
+
+// 第2引数からは書式と引数（なくてもよい）。
+#define ECO_ASSERT(cond_, ...) ECO_LOG_EXPAND_(ECO_LOG_ASSERT_IMPL_(cond_, #cond_, "" __VA_ARGS__))
+#define ECO_VERIFY(cond_, ...) ECO_LOG_EXPAND_(ECO_LOG_ASSERT_IMPL_(cond_, #cond_, "" __VA_ARGS__))
+#define ECO_CHECK(cond_, ...) ECO_LOG_EXPAND_(ECO_LOG_CHECK_IMPL_(cond_, #cond_, "" __VA_ARGS__))
+
+#else  // ECO_LOG_ASSERTS
+
+#define ECO_ASSERT(...) ((void)0)
+#define ECO_VERIFY(cond_, ...) ((void)(cond_))
+#define ECO_CHECK(cond_, ...) (static_cast<bool>(cond_))
+
+#endif  // ECO_LOG_ASSERTS
 
 #define ECO_LOG_TRACE(...) ECO_LOG_EXPAND_(ECO_LOG(::lg::Level::Trace, __VA_ARGS__))
 #define ECO_LOG_DEBUG(...) ECO_LOG_EXPAND_(ECO_LOG(::lg::Level::Debug, __VA_ARGS__))

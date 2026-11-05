@@ -38,6 +38,11 @@ TEST(Disabled, MacrosLeaveNoCode) {
     ECO_STAT_TIME("disabled.time");
     ECO_STAT_HISTORY("disabled.history", 4, sideEffect());
     ECO_SCOPE("disabled scope {}", sideEffect());
+    ECO_ASSERT(sideEffect() < 0, "x {}", sideEffect());
+    EXPECT_FALSE(ECO_CHECK(false));
+    ECO_VERIFY(sideEffect() > 0);
+    EXPECT_EQ(g_evaluated, 1);  // ECO_VERIFY の式だけ評価する
+    g_evaluated = 0;
     EXPECT_EQ(g_evaluated, 0);  // 引数も評価しない
     EXPECT_EQ(lgtest::countContaining(session.lines(), "disabled"), 0u);
 }

@@ -40,6 +40,9 @@ public:
     // 最近の値を写し取り、次の writeOut()・stop() で書く（lg::dumpHistory）。
     void dumpHistory(std::string_view reason);
 
+    // めったにない行を取っておき、次の writeOut()・stop() で書く（どのスレッドからでも）。
+    void queueEvent(EventKind kind, uint64_t tick, std::string body);
+
 private:
     struct Output {
         std::string name;
@@ -95,7 +98,7 @@ private:
     static void collectStats(ThreadBuffer& buffer, uint64_t epoch, StatTotals& totals);
     void foldRetiredStats(ThreadBuffer& buffer);  // 終わったスレッドの分を、次に出すまで取っておく
     void reportStats(bool force);                 // 期間が来ていれば（force なら必ず）集計を出す
-    void writePending();                          // dumpHistory で写し取った行を書く
+    void writePending();                          // 取っておいた行（dumpHistory・queueEvent）を書く
     double ticksToMicroseconds(double ticks) const;
 
     std::mutex io_;
@@ -112,7 +115,12 @@ private:
 
     StatTotals carried_;
     uint64_t lastStatNanoseconds_ = 0;
-    std::vector<std::pair<uint64_t, std::string>> pendingHistory_;  // 時刻と中身
+    struct PendingEvent {
+        EventKind kind;
+        uint64_t tick;
+        std::string body;
+    };
+    std::vector<PendingEvent> pending_;
 };
 
 Writer& writer();

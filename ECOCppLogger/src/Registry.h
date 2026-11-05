@@ -30,6 +30,7 @@ public:
 
     ThreadBuffer* create(uint64_t osThreadId);
     void setName(ThreadBuffer* buffer, std::string_view name);
+    std::string name(const ThreadBuffer* buffer);
     void removeRetired(const std::vector<ThreadBuffer*>& done);
 
     // これから作るバッファの大きさ・取っておく割合（start() の Config から）。

@@ -157,6 +157,14 @@ void Registry::setName(ThreadBuffer* buffer, std::string_view name) {
     }
 }
 
+std::string Registry::name(const ThreadBuffer* buffer) {
+    std::lock_guard lock(mutex_);
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+        if (buffers_[i].get() == buffer) return names_[i];
+    }
+    return {};
+}
+
 void Registry::removeRetired(const std::vector<ThreadBuffer*>& done) {
     if (done.empty()) {
         return;

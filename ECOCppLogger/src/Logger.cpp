@@ -1,10 +1,13 @@
 #include "ECOCppLogger/Logger.h"
 
+#include "ECOCppLogger/Assert.h"
+
 #include <cstdlib>
 #include <mutex>
 #include <new>
 
 #include "Registry.h"
+#include "Stack.h"
 #include "Writer.h"
 
 namespace lg {
@@ -43,6 +46,7 @@ bool start(const Config& config) {
     detail::g_level.store(static_cast<uint8_t>(config.level), std::memory_order_relaxed);
     detail::g_recordTime.store(config.recordTime, std::memory_order_relaxed);
     detail::g_recordFrame.store(config.recordFrame, std::memory_order_relaxed);
+    setAssertAction(config.assertAction);
     if (!detail::writer().start(config)) {
         return false;
     }
@@ -108,6 +112,18 @@ void nextFrame() noexcept {
 
 void dumpHistory(const char* reason) {
     detail::writer().dumpHistory(reason ? reason : "");
+}
+
+void writeStack(const char* reason) {
+    uint64_t addresses[64];
+    const size_t count = detail::captureStack(addresses, 64, 1);  // writeStack 自身は飛ばす
+    std::string body = "\"lv\":\"error\",\"event\":\"stack\",\"reason\":";
+    detail::appendJsonString(body, reason ? reason : "");
+    body.append(",\"th\":");
+    detail::appendJsonString(body, detail::Registry::instance().name(detail::threadBuffer()));
+    body.append(",\"stack\":");
+    detail::appendStackJson(body, addresses, count);
+    detail::writer().queueEvent(detail::EventKind::Event, ticks(), std::move(body));
 }
 
 void onFiberSwitch(uint64_t fiberId) noexcept {

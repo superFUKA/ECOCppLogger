@@ -57,6 +57,9 @@ uint64_t frame() noexcept;
 // 値は呼んだときに写し取る（その後に上書きされても残る）。落ちたときは自動で書き出す。
 void dumpHistory(const char* reason);
 
+// 呼んだスレッドのスタック（関数名・ソースの位置）を書き出す（"event":"stack" の行。次の writeOut() で書く）。
+void writeStack(const char* reason);
+
 // このスレッドで今からファイバー fiberId を走らせる（ファイバーの仕組みが、切り替えるたびに呼ぶ。0 はファイバーなし）。
 // 読む側は、ファイバーごとにスコープの積み重ねを組み立てる（スレッドを移っても続く）。
 void onFiberSwitch(uint64_t fiberId) noexcept;

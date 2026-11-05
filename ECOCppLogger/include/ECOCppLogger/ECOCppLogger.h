@@ -34,15 +34,18 @@
 #define ECO_LOG_EXPAND_(x) x
 
 // 呼び出し位置の静的な情報と、書式・引数の数の確認（eco_log_tags_ を先に定義しておく）。
-#define ECO_LOG_DEFINE_SITE_(lvl_, sampling_, samplingValue_, fmt_)                                                      \
+#define ECO_LOG_DEFINE_TYPED_SITE_(type_, lvl_, sampling_, samplingValue_, fmt_)                                        \
     static_assert(::eco::log::detail::countPlaceholders(fmt_) == eco_log_tags_::count,                                 \
                   "ECOCppLogger: 書式の {} の数と引数の数が合いません");                                                \
     static constexpr ::eco::log::Site eco_log_site_ {                                                                  \
         (lvl_), (fmt_), __FILE__, ::std::source_location::current().function_name(), __LINE__, eco_log_tags_::values,   \
             static_cast<::std::uint8_t>(eco_log_tags_::count), static_cast<::std::uint8_t>(sampling_),                 \
-            static_cast<::std::uint64_t>(samplingValue_)                                                               \
+            static_cast<::std::uint64_t>(samplingValue_), ::eco::log::toLogType(type_).name                            \
     };                                                                                                                 \
     static constinit ::eco::log::SiteIdSlot eco_log_id_ { 0 }
+
+#define ECO_LOG_DEFINE_SITE_(lvl_, sampling_, samplingValue_, fmt_) \
+    ECO_LOG_DEFINE_TYPED_SITE_(::eco::log::types::Log, lvl_, sampling_, samplingValue_, fmt_)
 
 // ---- ログ ---------------------------------------------------------------------------------------------
 
@@ -56,6 +59,24 @@
             }                                                                                           \
         }                                                                                               \
     } while (false)
+
+// 型（種類）を付けたログ。type は文字列リテラルか eco::log::LogType の定数（ECO_LOG_TYPE で作る）。
+//   ECO_LOG_TYPED("physics", eco::log::Level::Warn, "貫通 id={} depth={}", id, depth);
+//   ECO_LOG_TYPE(AiLog, "ai");  ECO_LOG_TYPED(AiLog, eco::log::Level::Debug, "経路 {} 手", steps);
+// 型は見るときの絞り込み用（ECOCppLoggerView --type physics,ai）。動いている間は何もしない。
+#define ECO_LOG_TYPED(type_, lvl_, fmt_, ...)                                                           \
+    do {                                                                                                \
+        if constexpr (static_cast<int>(lvl_) >= ECO_LOG_COMPILE_LEVEL) {                                \
+            if (::eco::log::detail::isEnabled(lvl_)) {                                                  \
+                using eco_log_tags_ = decltype(::eco::log::detail::tagList(__VA_ARGS__));               \
+                ECO_LOG_DEFINE_TYPED_SITE_(type_, lvl_, ::eco::log::Sampling::None, 0, fmt_);           \
+                ::eco::log::detail::Emitter{eco_log_site_, eco_log_id_}(__VA_ARGS__);                   \
+            }                                                                                           \
+        }                                                                                               \
+    } while (false)
+
+// 型の定数を作る（名前空間の中で。何度も使う型の書き間違いを防ぐ）。
+#define ECO_LOG_TYPE(var_, name_) inline constexpr ::eco::log::LogType var_ { name_ }
 
 #define ECO_LOG_TRACE(...) ECO_LOG_EXPAND_(ECO_LOG(::eco::log::Level::Trace, __VA_ARGS__))
 #define ECO_LOG_DEBUG(...) ECO_LOG_EXPAND_(ECO_LOG(::eco::log::Level::Debug, __VA_ARGS__))

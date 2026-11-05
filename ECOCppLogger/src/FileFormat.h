@@ -10,6 +10,7 @@
 //
 //   Clock    ：時刻の換算（ticks → UNIX 時刻）。始めと、集計のたび・落ちたときに書く（最後のものが一番正確）
 //   SiteDef  ：呼び出し位置（番号 → 書式・ファイル・行・関数・引数の型）。ファイルで初めて出たときに書く
+//   TypeDef  ：ログの型の番号（このファイルの中の連番）→ 名前。その型が初めて出たときに書く
 //   ThreadDef：スレッドの番号 → 名前
 //   Block    ：あるスレッドのリングバッファの中身（RecordHeader＋引数 の並び。詰め物を含むことがある）そのまま
 //   Event    ：めったにないもの（集計・最近の値・捨てた数・落ちた・始め・終わり）。時刻＋JSON の中身（"t" を除く）
@@ -19,7 +20,9 @@
 namespace eco::log::detail::file {
 
 inline constexpr char kMagic[8] = {'E', 'C', 'O', 'L', 'O', 'G', '\0', '\1'};
-inline constexpr std::uint32_t kVersion = 2;  // 2：記録の頭を 8 バイトに（RecordHeader）、まとめ書き・フレームの印
+// 2：記録の頭を 8 バイトに（RecordHeader）、まとめ書き・フレームの印
+// 3：ログの型（TypeDef。SiteDef が型の番号を持つ）
+inline constexpr std::uint32_t kVersion = 3;
 
 enum class FrameType : std::uint32_t {
     Clock = 1,
@@ -27,6 +30,7 @@ enum class FrameType : std::uint32_t {
     ThreadDef = 3,
     Block = 4,
     Event = 5,
+    TypeDef = 6,
 };
 
 struct FrameHeader {
@@ -51,7 +55,11 @@ struct SiteDefPayload {
     std::uint8_t sampling;
     std::uint8_t argCount;
     std::uint8_t reserved;
+    std::uint32_t type;  // ログの型の番号（TypeDef）
+    std::uint32_t reserved2;
 };
+
+// TypeDef の中身：uint32 の番号（このファイルの中で 1 からの連番）＋型の名前のバイト列
 
 // ThreadDef の中身：uint32 の番号＋名前のバイト列
 // Block の中身：uint32 のスレッドの番号＋uint32（予備）＋リングバッファのバイト列

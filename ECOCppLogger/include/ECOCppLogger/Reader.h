@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "ECOCppLogger/Level.h"
 
@@ -25,6 +26,11 @@ struct ViewFilter {
     std::string contains;        // 空でなければ、この文字列を含む行だけ
     bool fullPath = false;       // src にソースのフルパスを出す
     std::size_t batchRows = 0;   // 文章で、まとめ書きの塊ごとに出す件数（0 なら全部。JSON は常に全部）
+
+    // ログの型で絞り込む。types が空でなければ、その型だけ。excludeTypes の型は出さない。
+    // 型を付けないログは "log"。ログ以外の行は "stat"（集計）・"history"（最近の値）・"event"（始め・終わり・落ちた・捨てた）。
+    std::vector<std::string> types;
+    std::vector<std::string> excludeTypes;
 };
 
 class LogReader {

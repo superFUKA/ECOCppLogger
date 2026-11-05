@@ -31,6 +31,21 @@ enum class ArgTag : std::uint8_t {
 // 1つの文字列引数で残す最大のバイト数（超えた分は捨て、"…" を付ける）。
 inline constexpr std::size_t kMaxStringBytes = 4096;
 
+// ログの型（種類）。重さ（Level）とは別の軸で、「physics」「ai」「assert」のように文字列で付ける。
+// 呼び出し位置の静的な情報にだけ持ち、記録には何も足さない（動いている間のコストはない）。
+// ファイルには 型の名前 → 連番の ID の表を書き、見るとき（ECOCppLoggerView・readLog）に型で絞り込める。
+struct LogType {
+    const char* name;
+};
+
+namespace types {
+inline constexpr LogType Log{"log"};        // 型を指定しないログ
+inline constexpr LogType Assert{"assert"};  // アサート（ECO_ASSERT 用に取っておく）
+}  // namespace types
+
+constexpr LogType toLogType(LogType type) noexcept { return type; }
+constexpr LogType toLogType(const char* name) noexcept { return LogType{name}; }
+
 // 呼び出し位置ごとの静的な情報（マクロの中で static constexpr に作る）。
 struct Site {
     Level level;
@@ -42,6 +57,7 @@ struct Site {
     std::uint8_t argCount;
     std::uint8_t sampling;  // Sampling（間引きの種類。出力に添える）
     std::uint64_t samplingValue;
+    const char* type = types::Log.name;  // ログの型の名前
 };
 
 enum class Sampling : std::uint8_t {

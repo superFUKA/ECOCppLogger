@@ -42,6 +42,11 @@ T readValue(const std::byte*& cursor) {
     return value;
 }
 
+// 型を付けたログか（付けていないものは "log" で、出力では省く）。
+bool hasType(const Site& site) {
+    return site.type && std::string_view(site.type) != types::Log.name;
+}
+
 // 人向けの重さの欄（幅をそろえる）。
 std::string_view levelColumn(std::string_view level) {
     if (level == "trace") return "TRACE";
@@ -354,6 +359,10 @@ void LineFormatter::appendRecord(std::string& out, std::uint64_t tick, std::uint
         }
         out.push_back(' ');
         out.append(levelColumn(levelName(site.level)));
+        if (hasType(site)) {
+            out.append(" #");
+            out.append(site.type);
+        }
         out.append(" [");
         out.append(thread);
         out.append("] ");
@@ -396,7 +405,12 @@ void LineFormatter::appendRecord(std::string& out, std::uint64_t tick, std::uint
     if (out.size() != start) out.push_back(',');
     out.append("\"lv\":\"");
     out.append(levelName(site.level));
-    out.append("\",\"th\":");
+    out.push_back('"');
+    if (hasType(site)) {
+        out.append(",\"type\":");
+        appendJsonString(out, site.type);
+    }
+    out.append(",\"th\":");
     appendJsonString(out, thread);
     out.append(",\"src\":");
     appendJsonString(out, source_);
@@ -446,6 +460,10 @@ void LineFormatter::appendBatch(std::string& out, std::uint64_t tick, std::uint6
         }
         out.push_back(' ');
         out.append(levelColumn(levelName(site.level)));
+        if (hasType(site)) {
+            out.append(" #");
+            out.append(site.type);
+        }
         out.append(" [");
         out.append(thread);
         out.append("] ");
@@ -489,7 +507,12 @@ void LineFormatter::appendBatch(std::string& out, std::uint64_t tick, std::uint6
     if (out.size() != start) out.push_back(',');
     out.append("\"lv\":\"");
     out.append(levelName(site.level));
-    out.append("\",\"th\":");
+    out.push_back('"');
+    if (hasType(site)) {
+        out.append(",\"type\":");
+        appendJsonString(out, site.type);
+    }
+    out.append(",\"th\":");
     appendJsonString(out, thread);
     out.append(",\"src\":");
     appendJsonString(out, source_);

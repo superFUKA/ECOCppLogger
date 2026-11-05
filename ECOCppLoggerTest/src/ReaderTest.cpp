@@ -66,6 +66,48 @@ TEST(Reader, FiltersByLevelThreadAndText) {
     EXPECT_EQ(found.find("error line"), std::string::npos);
 }
 
+namespace {
+ECO_LOG_TYPE(AiLog, "ai");
+}
+
+TEST(Reader, FiltersByLogType) {
+    std::filesystem::path file;
+    {
+        Session session;
+        ECO_LOG_INFO("plain");
+        ECO_LOG_TYPED("physics", Level::Warn, "penetration depth={}", 0.25);
+        ECO_LOG_TYPED(AiLog, Level::Debug, "path {} steps", 12);
+        ECO_STAT("typed.stat", 1);
+        eco::log::flushStats();
+        file = eco::log::currentFile();
+    }
+    const auto all = readLines(file);
+    const std::string* physics = findContaining(all, "penetration");
+    ASSERT_NE(physics, nullptr);
+    EXPECT_NE(physics->find("\"lv\":\"warn\",\"type\":\"physics\",\"th\":"), std::string::npos) << *physics;
+    const std::string* plain = findContaining(all, "\"msg\":\"plain\"");
+    ASSERT_NE(plain, nullptr);
+    EXPECT_EQ(plain->find("\"type\""), std::string::npos) << *plain;  // 型なしは書かない
+
+    eco::log::ViewFilter only;
+    only.types = {"physics", "ai"};
+    const std::string typed = eco::log::readLog(file, ViewFormat::Text, only);
+    EXPECT_NE(typed.find("WARN  #physics ["), std::string::npos) << typed;
+    EXPECT_NE(typed.find("DEBUG #ai ["), std::string::npos) << typed;
+    EXPECT_EQ(typed.find("plain"), std::string::npos);
+    EXPECT_EQ(typed.find("typed.stat"), std::string::npos);
+    EXPECT_EQ(typed.find("session.start"), std::string::npos);
+
+    eco::log::ViewFilter exclude;
+    exclude.excludeTypes = {"ai", "event"};
+    const std::string rest = eco::log::readLog(file, ViewFormat::Text, exclude);
+    EXPECT_NE(rest.find("plain"), std::string::npos);
+    EXPECT_NE(rest.find("penetration"), std::string::npos);
+    EXPECT_NE(rest.find("typed.stat"), std::string::npos);
+    EXPECT_EQ(rest.find("path 12 steps"), std::string::npos);
+    EXPECT_EQ(rest.find("session.start"), std::string::npos);
+}
+
 TEST(Reader, OmitsTimeWhenNotRecorded) {
     auto config = testConfig();
     config.recordTime = false;

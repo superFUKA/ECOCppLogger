@@ -5,12 +5,16 @@
 //   --json            LLM 向けの JSON Lines で出す（既定は人向けの文章）
 //   --level <重さ>     trace / debug / info / warn / error / fatal 以上だけ
 //   --thread <名前>    このスレッドのログだけ
+//   --type <型,…>      この型のログだけ（log＝型なし、stat＝集計、history＝最近の値、event＝始め・終わり・落ちた・捨てた）
+//   --exclude-type <型,…> この型のログを出さない
+//   --batch-rows <件数> 文章で、まとめ書きの塊ごとに出す件数（既定は全部）
 //   --grep <文字列>    この文字列を含む行だけ
 //   --follow          書き足されるのを待って出し続ける（動いている最中のログを見る。Ctrl+C で終わる）
 //   --out <ファイル>   標準出力でなくファイルへ書く
 //   --full-path       src にソースのフルパスを出す
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -31,7 +35,10 @@ namespace {
 void usage() {
     std::fputs(
         "使い方: ECOCppLoggerView <ファイル.ecolog | フォルダー> [--json] [--level <重さ>] [--thread <名前>]\n"
-        "                         [--grep <文字列>] [--follow] [--out <ファイル>] [--full-path]\n",
+        "                         [--type <型,型…>] [--exclude-type <型,型…>] [--grep <文字列>]\n"
+        "                         [--batch-rows <件数>] [--follow] [--out <ファイル>] [--full-path]\n"
+        "  型：ログに付けた型（physics 等）。付けていないログは log、集計は stat、最近の値は history、\n"
+        "      始め・終わり・落ちた・捨てた は event\n",
         stderr);
 }
 
@@ -76,6 +83,20 @@ int main(int argc, char** argv) {
             const char* value = next();
             if (!value) return usage(), 2;
             filter.thread = value;
+        } else if (argument == "--type" || argument == "--exclude-type") {
+            const char* value = next();
+            if (!value) return usage(), 2;
+            auto& list = argument == "--type" ? filter.types : filter.excludeTypes;
+            std::string_view rest = value;
+            while (!rest.empty()) {
+                const auto comma = rest.find(',');
+                list.emplace_back(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+            }
+        } else if (argument == "--batch-rows") {
+            const char* value = next();
+            if (!value) return usage(), 2;
+            filter.batchRows = static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
         } else if (argument == "--grep") {
             const char* value = next();
             if (!value) return usage(), 2;

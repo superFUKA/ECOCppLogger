@@ -24,7 +24,9 @@ constexpr std::string_view kAbout =
     "total=calls since start, unit=us means durations in microseconds. lv=history lines list the most recent "
     "values of ECO_HISTORY kept in memory, written on crash or dumpHistory(reason); points are "
     "[f, ms before t, value], oldest first. event=dropped means the thread's buffer was full and that many "
-    "records were lost. event=crash has the reason, exception and stack.";
+    "records were lost. event=crash has the reason, exception and stack. type=the kind of log given by the "
+    "program (e.g. physics, ai, assert); missing means a plain log. batch lines (ECO_LOG_BATCH) hold many entries "
+    "of one format: msg is the format, rows are the values of each entry in order, duration_us spans them.";
 
 // 読んだ呼び出し位置（Site が指す文字列はここで持つ）。
 struct OwnedSite {
@@ -32,8 +34,23 @@ struct OwnedSite {
     std::string format;
     std::string fileName;
     std::string function;
+    std::string type;
     std::vector<ArgTag> tags;
 };
+
+// Event の型（絞り込み用）：集計・最近の値・それ以外。
+std::string_view eventType(std::string_view body) {
+    if (body.find("\"lv\":\"stat\"") != std::string_view::npos) return "stat";
+    if (body.find("\"lv\":\"history\"") != std::string_view::npos) return "history";
+    return "event";
+}
+
+bool typeSelected(const ViewFilter& filter, std::string_view type) {
+    const auto contains = [&](const std::vector<std::string>& list) {
+        return std::find(list.begin(), list.end(), type) != list.end();
+    };
+    return (filter.types.empty() || contains(filter.types)) && !contains(filter.excludeTypes);
+}
 
 enum class EntryKind { Record, Batch, Frame, Event };
 
@@ -83,6 +100,7 @@ struct LogReader::State {
     bool invalid = false;
     std::unordered_map<std::uint64_t, std::unique_ptr<OwnedSite>> sites;
     std::unordered_map<std::uint32_t, std::string> threads;
+    std::unordered_map<std::uint32_t, std::string> types;  // ログの型の番号 → 名前
     std::vector<Entry> entries;
     std::uint64_t currentFrame = 0;  // 時刻の順に並べたとき、最後に通った Frame の印
 
@@ -114,11 +132,19 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
         owned->format = readString(cursor, end);
         owned->fileName = readString(cursor, end);
         owned->function = readString(cursor, end);
+        auto type = types.find(payload.type);
+        owned->type = type != types.end() ? type->second : std::string(types::Log.name);
         owned->tags.push_back(ArgTag::None);  // 空でも data() が使えるように
         owned->site = Site{static_cast<Level>(payload.level), owned->format, owned->fileName.c_str(),
                            owned->function.c_str(), payload.line, owned->tags.data(), payload.argCount,
-                           payload.sampling, payload.samplingValue};
+                           payload.sampling, payload.samplingValue, owned->type.c_str()};
         sites[payload.id] = std::move(owned);
+        return;
+    }
+    case file::FrameType::TypeDef: {
+        if (size < 4) return;
+        const auto id = read<std::uint32_t>(cursor);
+        types[id] = std::string(cursor, end);
         return;
     }
     case file::FrameType::ThreadDef: {
@@ -149,7 +175,8 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
                 entries.push_back(std::move(entry));
             } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
                 auto found = sites.find(header.site);
-                if (found != sites.end() && found->second->site.level >= filter.level) {
+                if (found != sites.end() && found->second->site.level >= filter.level &&
+                    typeSelected(filter, found->second->type)) {
                     entries.push_back(Entry{order, view.tick,
                                             header.kind == RecordKind::Log ? EntryKind::Record : EntryKind::Batch,
                                             thread, found->second.get(), std::move(record), {}});
@@ -163,7 +190,7 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
         if (size < 8) return;
         const auto tick = read<std::uint64_t>(cursor);
         std::string body(cursor, end);
-        if (eventLevel(body) < filter.level) return;
+        if (eventLevel(body) < filter.level || !typeSelected(filter, eventType(body))) return;
         entries.push_back(Entry{tick, tick, EntryKind::Event, 0, nullptr, {}, std::move(body)});
         return;
     }

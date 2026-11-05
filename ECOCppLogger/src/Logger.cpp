@@ -174,6 +174,7 @@ private:
     // このファイルに書いた呼び出し位置（番号ごと）・スレッドの名前（ファイルを替えたら書き直す）
     std::vector<bool> knownSites_;
     std::uint32_t lastSite_ = 0;
+    std::unordered_map<std::string, std::uint32_t> typeIds_;
     std::unordered_map<std::uint32_t, std::string> knownThreads_;
 
     std::mutex dumpMutex_;
@@ -224,8 +225,14 @@ void Backend::writeClock() {
 }
 
 void Backend::writeSiteDef(std::uint32_t id, const Site& site) {
-    const file::SiteDefPayload payload{id, site.samplingValue, site.line,
-                                       static_cast<std::uint8_t>(site.level), site.sampling, site.argCount, 0};
+    // 型の名前に、このファイルの中の連番を振る（初めての名前なら TypeDef を先に書く）。
+    const std::string_view typeName = site.type ? site.type : types::Log.name;
+    auto [type, inserted] = typeIds_.try_emplace(std::string(typeName), static_cast<std::uint32_t>(typeIds_.size() + 1));
+    if (inserted) {
+        appendFrame(file::FrameType::TypeDef, {{&type->second, 4}, {typeName.data(), typeName.size()}});
+    }
+    const file::SiteDefPayload payload{id, site.samplingValue, site.line, static_cast<std::uint8_t>(site.level),
+                                       site.sampling, site.argCount, 0, type->second, 0};
     const std::string_view fileName = site.file;
     const std::string_view function = site.function;
     const auto formatLength = static_cast<std::uint32_t>(site.format.size());
@@ -277,6 +284,7 @@ bool Backend::openFile() {
     // ファイルごとに読めるように、頭・時刻の換算・始めの Event を書き、呼び出し位置・スレッドは書き直す。
     knownSites_.clear();
     lastSite_ = 0;
+    typeIds_.clear();
     knownThreads_.clear();
     out_.append(file::kMagic, sizeof(file::kMagic));
     out_.append(reinterpret_cast<const char*>(&file::kVersion), sizeof(file::kVersion));

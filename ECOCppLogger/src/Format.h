@@ -60,6 +60,12 @@ public:
     }
     const TimeBase& timeBase() const noexcept { return timeBase_; }
 
+    // 次に書く行の、スコープの積み重ね（"Update > Physics"、空ならなし）と走っているファイバー（0 ならなし）。
+    void setContext(std::string_view scope, uint64_t fiber) {
+        scope_.assign(scope);
+        fiber_ = fiber;
+    }
+
     // ログ1件（tick が 0 なら時刻なし、frame が 0 ならフレームなし）→ 1行（改行つき）。
     void appendRecord(std::string& out, uint64_t tick, uint64_t frame, uint64_t aux, const Site& site,
                       const unsigned char* arguments, std::string_view thread);
@@ -67,6 +73,11 @@ public:
     // まとめ書きの塊1件（payload は BatchInfo から）。maxRows が 0 でなければ、その件数まで。
     void appendBatch(std::string& out, uint64_t tick, uint64_t frame, const Site& site, const unsigned char* payload,
                      size_t payloadSize, std::string_view thread, uint32_t maxRows);
+
+    // スコープに入る・出る（ECO_SCOPE）。name・argsJson は入るときの本文と名前付きの値（renderMessage で作る）。
+    // microseconds が負ならかかった時間なし。
+    void appendScope(std::string& out, uint64_t tick, uint64_t frame, const Site& site, std::string_view name,
+                     std::string_view argsJson, std::string_view thread, bool enter, double microseconds);
 
     // めったにないもの（集計・始め・終わり 等）。body は "t" を除く JSON の中身（"lv":"…",…）。
     void appendEvent(std::string& out, uint64_t tick, std::string_view body);
@@ -85,6 +96,8 @@ private:
     int64_t cachedSecond_ = 0;
     std::string cachedPrefix_;
     std::string cachedSuffix_;
+    std::string scope_;
+    uint64_t fiber_ = 0;
 };
 
 }  // namespace lg::detail

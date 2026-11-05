@@ -57,6 +57,10 @@ uint64_t frame() noexcept;
 // 値は呼んだときに写し取る（その後に上書きされても残る）。落ちたときは自動で書き出す。
 void dumpHistory(const char* reason);
 
+// このスレッドで今からファイバー fiberId を走らせる（ファイバーの仕組みが、切り替えるたびに呼ぶ。0 はファイバーなし）。
+// 読む側は、ファイバーごとにスコープの積み重ねを組み立てる（スレッドを移っても続く）。
+void onFiberSwitch(uint64_t fiberId) noexcept;
+
 namespace detail {
 
 extern std::atomic<uint8_t> g_level;
@@ -89,9 +93,10 @@ inline uint32_t siteId(const Site& site, SiteIdSlot& slot) noexcept {
     return id;
 }
 
-// 1件：頭（8）［＋時刻（8）］［＋間引き（8）］＋引数。
+// 1件：頭（8）［＋時刻（8）］［＋間引き・トークン（8）］＋引数。書けなければ false（捨てて数えた）。
 template <bool HasAux, class... Normalized>
-inline void emitNormalized(const Site& site, SiteIdSlot& slot, uint64_t aux, const Normalized&... values) noexcept {
+inline bool emitRecord(RecordKind kind, const Site& site, SiteIdSlot& slot, uint64_t aux,
+                       const Normalized&... values) noexcept {
     ThreadBuffer* buffer = threadBuffer();
     const uint32_t id = siteId(site, slot);
     const bool withTime = recordTime();
@@ -100,9 +105,9 @@ inline void emitNormalized(const Site& site, SiteIdSlot& slot, uint64_t aux, con
     unsigned char* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size, site.level >= Level::Warn) : nullptr;
     if (!out) [[unlikely]] {
         buffer->countDrop();
-        return;
+        return false;
     }
-    const RecordHeader header{static_cast<uint16_t>(size), RecordKind::Log,
+    const RecordHeader header{static_cast<uint16_t>(size), kind,
                               static_cast<uint8_t>((withTime ? kRecordHasTick : 0) | (HasAux ? kRecordHasAux : 0)), id};
     memcpy(out, &header, sizeof(header));
     unsigned char* cursor = out + sizeof(RecordHeader);
@@ -117,6 +122,12 @@ inline void emitNormalized(const Site& site, SiteIdSlot& slot, uint64_t aux, con
     }
     ((cursor = encode(cursor, values)), ...);
     buffer->commit();
+    return true;
+}
+
+template <bool HasAux, class... Normalized>
+inline void emitNormalized(const Site& site, SiteIdSlot& slot, uint64_t aux, const Normalized&... values) noexcept {
+    emitRecord<HasAux>(RecordKind::Log, site, slot, aux, values...);
 }
 
 // マクロが作る呼び出し口：Emitter{site, id}(引数...)。引数がなくても () で呼べる。
@@ -140,6 +151,37 @@ struct SampledEmitter {
     void operator()(const Args&... args) const noexcept {
         emitNormalized<true>(site, id, aux, normalize(args)...);
     }
+};
+
+// ---- スコープ ----------------------------------------------------------------------------------------
+
+// ECO_SCOPE が作る：作るときに「入る」、壊すときに「出る」を書く。対にするトークンはこの物のアドレス
+// （生きている間は重ならない。ファイバーで別のスレッドへ移って出ても、読む側がトークンで対にする）。
+class ScopeGuard {
+public:
+    ScopeGuard(const Site& site, SiteIdSlot& id, bool compiled) noexcept
+        : site_(site), id_(id), active_(compiled && isEnabled(site.level)) {}
+    ~ScopeGuard() {
+        if (active_) {
+            emitRecord<true>(RecordKind::ScopeExit, site_, id_, token());
+        }
+    }
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+
+    bool active() const noexcept { return active_; }
+
+    template <class... Args>
+    void enter(const Args&... args) noexcept {
+        active_ = emitRecord<true>(RecordKind::ScopeEnter, site_, id_, token(), normalize(args)...);
+    }
+
+private:
+    uint64_t token() const noexcept { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)); }
+
+    const Site& site_;
+    SiteIdSlot& id_;
+    bool active_;
 };
 
 // ---- 間引き ---------------------------------------------------------------------------------------------

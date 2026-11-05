@@ -28,6 +28,7 @@ struct LogType {
 namespace types {
 inline constexpr LogType Log{"log"};        // 型を指定しないログ
 inline constexpr LogType Assert{"assert"};  // アサート
+inline constexpr LogType Scope{"scope"};    // スコープ（ECO_SCOPE）の入る・出る
 }  // namespace types
 
 // 呼び出し位置の「重さ＋型」。マクロの第1引数（Warn・Warn | Physics・Warn | "physics"）から作る。
@@ -97,9 +98,9 @@ enum class RecordKind : uint8_t {
     Log,          // 頭［＋時刻］［＋間引き］＋引数
     Batch,        // 頭［＋時刻］＋BatchInfo＋値の並び（件数ぶん、頭なし）
     Frame,        // 頭［＋時刻］＋uint64 のフレーム番号（ここから後の記録はこのフレーム）
-    ScopeEnter,   // 頭［＋時刻］＋uint64 のトークン＋引数
-    ScopeExit,    // 頭［＋時刻］＋uint64 のトークン
-    FiberSwitch,  // 頭［＋時刻］＋uint64 のファイバーの ID（このスレッドで今から走るファイバー）
+    ScopeEnter,   // 頭［＋時刻］＋aux（uint64 のトークン）＋引数
+    ScopeExit,    // 頭［＋時刻］＋aux（uint64 のトークン）
+    FiberSwitch,  // 頭［＋時刻］＋aux（uint64 のファイバーの ID：このスレッドで今から走るファイバー）
 };
 
 enum RecordFlags : uint8_t {
@@ -112,7 +113,7 @@ struct RecordHeader {
     uint16_t size;
     RecordKind kind;
     uint8_t flags;  // RecordFlags
-    uint32_t site;  // 呼び出し位置の番号（Log・Batch・ScopeEnter。ほかは 0）
+    uint32_t site;  // 呼び出し位置の番号（Log・Batch・ScopeEnter・ScopeExit。ほかは 0）
 };
 static_assert(sizeof(RecordHeader) == 8);
 

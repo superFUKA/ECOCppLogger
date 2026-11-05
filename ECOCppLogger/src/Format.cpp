@@ -489,7 +489,16 @@ void LineFormatter::appendTextPrefix(std::string& out, uint64_t tick, uint64_t f
     }
     out.append(" [");
     out.append(thread);
+    if (fiber_ != 0) {
+        out.append(" fiber ");
+        appendUnsigned(out, fiber_);
+    }
     out.append("] ");
+    if (!scope_.empty()) {
+        out.push_back('{');
+        out.append(scope_);
+        out.append("} ");
+    }
     out.append(sourceFileName(site.file, fullPath_));
     out.push_back(':');
     appendUnsigned(out, site.line);
@@ -518,6 +527,14 @@ void LineFormatter::appendJsonPrefix(std::string& out, uint64_t tick, uint64_t f
     }
     out.append(",\"th\":");
     appendJsonString(out, thread);
+    if (fiber_ != 0) {
+        out.append(",\"fiber\":");
+        appendUnsigned(out, fiber_);
+    }
+    if (!scope_.empty()) {
+        out.append(",\"scope\":");
+        appendJsonString(out, scope_);
+    }
     source_.assign(sourceFileName(site.file, fullPath_));
     source_.push_back(':');
     appendUnsigned(source_, site.line);
@@ -654,6 +671,36 @@ void LineFormatter::appendBatch(std::string& out, uint64_t tick, uint64_t frame,
     if (shown < count) {
         out.append(",\"omitted\":");
         appendUnsigned(out, count - shown);
+    }
+    out.append("}\n");
+}
+
+void LineFormatter::appendScope(std::string& out, uint64_t tick, uint64_t frame, const Site& site,
+                                std::string_view name, std::string_view argsJson, std::string_view thread, bool enter,
+                                double microseconds) {
+    if (format_ == OutputFormat::Text) {
+        appendTextPrefix(out, tick, frame, site, thread);
+        out.append(enter ? "enter " : "exit ");
+        out.append(name);
+        if (microseconds >= 0) {
+            out.append(" (");
+            appendFormattedDouble(out, microseconds, Spec{false, 0, 1, 0});
+            out.append("us)");
+        }
+        out.push_back('\n');
+        return;
+    }
+    appendJsonPrefix(out, tick, frame, site, thread);
+    out.append(",\"msg\":");
+    appendJsonString(out, name);
+    if (enter && !argsJson.empty()) {
+        out.append(",\"args\":");
+        out.append(argsJson);
+    }
+    out.append(enter ? ",\"scope_event\":\"enter\"" : ",\"scope_event\":\"exit\"");
+    if (microseconds >= 0) {
+        out.append(",\"us\":");
+        appendDouble(out, std::round(microseconds * 10.0) / 10.0);
     }
     out.append("}\n");
 }

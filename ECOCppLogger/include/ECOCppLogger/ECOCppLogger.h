@@ -265,6 +265,51 @@
 
 #endif  // ECO_LOG_ENABLE
 
+// ---- スコープ：処理の入れ子（"Update > Physics > Solve"）を、その中のログに "scope" として付ける -----------------
+//
+//   void solve(int body) {
+//       ECO_SCOPE("Solve body={body}", body);   // 入る・出る（かかった時間）を書く。重さは Debug、型は "scope"
+//       ECO_LOG_WARN("貫通");                    // → "scope":"Update > Physics > Solve body=3"
+//   }
+// ファイバーを使うなら、切り替えるたびに lg::onFiberSwitch(fiberId) を呼ぶ（スレッドを移ってもスコープが続く）。
+// ECO_LOG_SCOPES=0 で消える（既定は ECO_LOG_ENABLE と同じ）。
+
+#ifndef ECO_LOG_SCOPES
+#define ECO_LOG_SCOPES ECO_LOG_ENABLE
+#endif
+
+#if ECO_LOG_SCOPES
+
+#define ECO_SCOPE(fmt_, ...)                                                                                   \
+    using ECO_LOG_CAT_(eco_scope_tags_, __LINE__) = decltype(::lg::detail::tagList(__VA_ARGS__));             \
+    static_assert(::lg::detail::countPlaceholders(fmt_) == ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::count,    \
+                  "ECOCppLogger: 書式の {} の数と引数の数が合いません");                                        \
+    static constexpr ::lg::Site ECO_LOG_CAT_(eco_scope_site_, __LINE__){                                       \
+        ::lg::Level::Debug,                                                                                    \
+        ::lg::types::Scope.name,                                                                               \
+        (fmt_),                                                                                                \
+        __FILE__,                                                                                              \
+        ::std::source_location::current().function_name(),                                                    \
+        __LINE__,                                                                                              \
+        ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::values,                                                       \
+        static_cast<::uint8_t>(ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::count),                                \
+        ::lg::Sampling::None,                                                                                  \
+        0,                                                                                                     \
+        ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::tagCount,                                                     \
+        ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::structNames,                                                  \
+        ECO_LOG_CAT_(eco_scope_tags_, __LINE__)::structCount};                                                 \
+    static constinit ::lg::SiteIdSlot ECO_LOG_CAT_(eco_scope_id_, __LINE__){0};                               \
+    ::lg::detail::ScopeGuard ECO_LOG_CAT_(eco_scope_, __LINE__){                                               \
+        ECO_LOG_CAT_(eco_scope_site_, __LINE__), ECO_LOG_CAT_(eco_scope_id_, __LINE__),                        \
+        static_cast<int>(::lg::Level::Debug) >= ECO_LOG_COMPILE_LEVEL};                                        \
+    if (ECO_LOG_CAT_(eco_scope_, __LINE__).active()) ECO_LOG_CAT_(eco_scope_, __LINE__).enter(__VA_ARGS__)
+
+#else
+
+#define ECO_SCOPE(...) ((void)0)
+
+#endif  // ECO_LOG_SCOPES
+
 // ---- 集計：毎回は書かず、期間（Config::statIntervalMs）ごとに 回数・平均・最小・最大・最後 を1行で出す ----------
 // 重さに関係なく数える。ECO_LOG_STATS=0 で消える（既定は ECO_LOG_ENABLE と同じ）。name は文字列リテラル。
 
@@ -274,20 +319,36 @@
 
 #if ECO_LOG_STATS
 
-#define ECO_LOG_STAT_SITE_(name_, kind_, capacity_)     static constinit ::lg::StatSite eco_stat_site_ { (name_), __FILE__, __LINE__, (kind_), (capacity_) }
+#define ECO_LOG_STAT_SITE_(name_, kind_, capacity_) \
+    static constinit ::lg::StatSite eco_stat_site_ { (name_), __FILE__, __LINE__, (kind_), (capacity_) }
 
 // 値を集計する（約2ns）。
-#define ECO_STAT(name_, value_)                                                           do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, 0);                                  ::lg::detail::addStat(eco_stat_site_, static_cast<double>(value_));               } while (false)
+#define ECO_STAT(name_, value_)                                                 \
+    do {                                                                        \
+        ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, 0);                    \
+        ::lg::detail::addStat(eco_stat_site_, static_cast<double>(value_));     \
+    } while (false)
 
 // 通った回数を数える（出力は回数と1秒あたり）。
-#define ECO_STAT_COUNT(name_)                                                             do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Count, 0);                                  ::lg::detail::addStat(eco_stat_site_, 1.0);                                       } while (false)
+#define ECO_STAT_COUNT(name_)                                                   \
+    do {                                                                        \
+        ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Count, 0);                    \
+        ::lg::detail::addStat(eco_stat_site_, 1.0);                             \
+    } while (false)
 
 // この行からスコープの終わりまでの時間を集計する（出力はマイクロ秒）。
-#define ECO_STAT_TIME(name_)                                                                                        static constinit ::lg::StatSite ECO_LOG_CAT_(eco_stat_time_site_, __LINE__){(name_), __FILE__, __LINE__,                                                                                    ::lg::StatKind::Time, 0};          ::lg::detail::StatTimer ECO_LOG_CAT_(eco_stat_timer_, __LINE__) { ECO_LOG_CAT_(eco_stat_time_site_, __LINE__) }
+#define ECO_STAT_TIME(name_)                                                                                 \
+    static constinit ::lg::StatSite ECO_LOG_CAT_(eco_stat_time_site_, __LINE__){(name_), __FILE__, __LINE__, \
+                                                                                ::lg::StatKind::Time, 0};   \
+    ::lg::detail::StatTimer ECO_LOG_CAT_(eco_stat_timer_, __LINE__) { ECO_LOG_CAT_(eco_stat_time_site_, __LINE__) }
 
 // 値を集計し（ECO_STAT と同じ）、さらに最近の capacity 個をスレッドごとに覚えておく。ファイルには普段は書かず、
 // lg::dumpHistory("理由") を呼んだとき・落ちたときに、何ms前か・フレーム番号と一緒に書き出す。
-#define ECO_STAT_HISTORY(name_, capacity_, value_)                                        do {                                                                                      ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, (capacity_));                        ::lg::detail::addHistory(eco_stat_site_, static_cast<double>(value_));            } while (false)
+#define ECO_STAT_HISTORY(name_, capacity_, value_)                              \
+    do {                                                                        \
+        ECO_LOG_STAT_SITE_(name_, ::lg::StatKind::Value, (capacity_));          \
+        ::lg::detail::addHistory(eco_stat_site_, static_cast<double>(value_));  \
+    } while (false)
 
 #else  // ECO_LOG_STATS
 

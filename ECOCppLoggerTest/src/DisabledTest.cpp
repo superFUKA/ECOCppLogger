@@ -37,6 +37,7 @@ TEST(Disabled, MacrosLeaveNoCode) {
     ECO_STAT_COUNT("disabled.count");
     ECO_STAT_TIME("disabled.time");
     ECO_STAT_HISTORY("disabled.history", 4, sideEffect());
+    ECO_SCOPE("disabled scope {}", sideEffect());
     EXPECT_EQ(g_evaluated, 0);  // 引数も評価しない
     EXPECT_EQ(lgtest::countContaining(session.lines(), "disabled"), 0u);
 }

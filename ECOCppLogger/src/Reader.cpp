@@ -22,7 +22,8 @@ constexpr std::string_view kAbout =
     "JSON Lines decoded from an ECOCppLogger .ecolog file. t=local time (missing when record_time is false; then "
     "lines keep the order within each thread, and across threads only roughly), f=frame number, lv=level, "
     "type=kind of log given by the program (missing means a plain log), th=thread, src=file:line, fn=function, "
-    "msg=message, args=named values of the message. sample=this site is sampled (n=call count, skipped=calls not "
+    "msg=message, args=named values of the message, scope=nested ECO_SCOPE names the line is in (outer > inner), "
+    "fiber=fiber the thread was running, scope_event=enter/exit of a scope (us=time spent inside). sample=this site is sampled (n=call count, skipped=calls not "
     "logged since the previous line, on change=written only when the value changed, change=0 is the first value). "
     "batch=a loop logged in one block (rows=values of each iteration, us=time the block took, omitted=rows not shown). "
     "event=dropped means the thread's buffer was full and that many records were lost. event=crash has the reason, "
@@ -39,7 +40,16 @@ struct OwnedSite {
     std::vector<const char*> structNamePointers;
 };
 
-enum class EntryKind { Record, Batch, Frame, Event };
+enum class EntryKind { Record, Batch, Frame, Event, ScopeEnter, ScopeExit, FiberSwitch };
+
+// 開いているスコープ（ECO_SCOPE）。
+struct OpenScope {
+    uint64_t token;
+    std::string name;  // 本文
+    std::string word;  // 最初の語（絞り込みに使う）
+    std::string args;  // 名前付きの値（JSON）
+    uint64_t tick;
+};
 
 struct Entry {
     uint64_t order;  // 並べる時刻（時刻のない記録は書き写した時刻）
@@ -123,6 +133,10 @@ struct LogReader::State {
     std::unordered_map<uint32_t, std::string> threads;
     std::vector<Entry> entries;
     uint64_t currentFrame = 0;
+    std::vector<std::string> scopeFilter;
+    std::unordered_map<uint32_t, uint64_t> threadFiber;               // スレッドで今走っているファイバー
+    std::unordered_map<uint64_t, std::vector<OpenScope>> openScopes;  // ファイバー（なければスレッド）ごと
+    std::string message;
     std::string out;
 
     State(ViewFormat format_, const ViewFilter& filter)
@@ -136,7 +150,30 @@ struct LogReader::State {
           contains(filter.contains ? filter.contains : ""),
           firstFrame(filter.firstFrame),
           lastFrame(filter.lastFrame),
-          batchRows(filter.batchRows) {}
+          batchRows(filter.batchRows),
+          scopeFilter(splitList(filter.scopes)) {}
+
+    uint64_t contextOf(uint32_t thread) const {
+        auto fiber = threadFiber.find(thread);
+        return fiber != threadFiber.end() && fiber->second != 0 ? fiber->second : (uint64_t{1} << 63) | thread;
+    }
+
+    std::string scopePath(const std::vector<OpenScope>& stack) const {
+        std::string path;
+        for (const OpenScope& scope : stack) {
+            if (!path.empty()) path.append(" > ");
+            path.append(scope.name);
+        }
+        return path;
+    }
+
+    bool inSelectedScope(const std::vector<OpenScope>& stack) const {
+        if (scopeFilter.empty()) return true;
+        for (const OpenScope& scope : stack) {
+            if (listed(scopeFilter, scope.word)) return true;
+        }
+        return false;
+    }
 
     bool typeSelected(std::string_view type, bool batch) const {
         const bool included = types.empty() || listed(types, type) || (batch && listed(types, "batch"));
@@ -223,6 +260,17 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
                     Entry entry{order, view.tick, EntryKind::Frame, block.thread, nullptr, {}, {}};
                     std::memcpy(&entry.frame, view.payload, 8);
                     entries.push_back(std::move(entry));
+                } else if (header.kind == RecordKind::FiberSwitch) {
+                    entries.push_back(Entry{order, view.tick, EntryKind::FiberSwitch, block.thread, nullptr,
+                                            std::move(record), {}});
+                } else if (header.kind == RecordKind::ScopeEnter || header.kind == RecordKind::ScopeExit) {
+                    auto found = sites.find(header.site);  // 積み重ねを組み立てるため、絞り込まずに取っておく
+                    if (found != sites.end()) {
+                        entries.push_back(Entry{order, view.tick,
+                                                header.kind == RecordKind::ScopeEnter ? EntryKind::ScopeEnter
+                                                                                      : EntryKind::ScopeExit,
+                                                block.thread, found->second.get(), std::move(record), {}});
+                    }
                 } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
                     auto found = sites.find(header.site);
                     const bool batch = header.kind == RecordKind::Batch;
@@ -297,9 +345,12 @@ const char* LogReader::take(size_t& size) {
             s.currentFrame = entry.frame;  // ここから後の記録はこのフレーム
             continue;
         }
-        if (entry.kind != EntryKind::Event && (s.currentFrame < s.firstFrame || s.currentFrame > s.lastFrame)) {
+        if (entry.kind == EntryKind::FiberSwitch) {
+            const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(entry.record.data()));
+            s.threadFiber[entry.thread] = view.aux;
             continue;
         }
+        const bool inFrames = s.currentFrame >= s.firstFrame && s.currentFrame <= s.lastFrame;
         line.clear();
         if (entry.kind == EntryKind::Event) {
             if (s.format == ViewFormat::Json && entry.body.find("\"event\":\"session.start\"") != std::string::npos) {
@@ -313,16 +364,70 @@ const char* LogReader::take(size_t& size) {
         } else {
             auto name = s.threads.find(entry.thread);
             const std::string thread = name != s.threads.end() ? name->second : "T" + std::to_string(entry.thread);
-            if (!s.threadNames.empty() && !listed(s.threadNames, thread)) continue;
             const auto* header = reinterpret_cast<const RecordHeader*>(entry.record.data());
             const RecordView view = viewRecord(*header);
-            if (entry.kind == EntryKind::Record) {
-                s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, entry.site->site, view.payload,
-                                         thread);
+            const uint64_t context = s.contextOf(entry.thread);
+            const uint64_t fiber = (context >> 63) != 0 ? 0 : context;
+            std::vector<OpenScope>& stack = s.openScopes[context];
+            const Site& site = entry.site->site;
+            const bool shown = inFrames && (s.threadNames.empty() || listed(s.threadNames, thread));
+
+            if (entry.kind == EntryKind::ScopeEnter || entry.kind == EntryKind::ScopeExit) {
+                const bool visible = shown && site.level >= s.level && s.typeSelected(entry.site->type, false);
+                if (entry.kind == EntryKind::ScopeEnter) {
+                    OpenScope opened{view.aux, {}, {}, {}, view.tick};
+                    detail::renderMessage(opened.name, &opened.args, site, view.payload);
+                    opened.word = opened.name.substr(0, opened.name.find(' '));
+                    const bool selected = s.inSelectedScope(stack);
+                    s.formatter.setContext(s.scopePath(stack), fiber);
+                    stack.push_back(std::move(opened));
+                    if (!visible || !(selected || s.inSelectedScope(stack))) continue;
+                    const OpenScope& top = stack.back();
+                    s.formatter.appendScope(line, view.tick, s.currentFrame, site, top.name, top.args, thread, true,
+                                            -1.0);
+                } else {
+                    // 出る：トークンで対にする（ファイバーが ID を知らせずに移ったときは、ほかの積み重ねも探す）
+                    std::vector<OpenScope>* owner = &stack;
+                    auto match = [&](std::vector<OpenScope>& candidates) {
+                        for (size_t i = candidates.size(); i-- > 0;) {
+                            if (candidates[i].token == view.aux) return i;
+                        }
+                        return std::string::npos;
+                    };
+                    size_t at = match(stack);
+                    if (at == std::string::npos) {
+                        for (auto& [key, other] : s.openScopes) {
+                            if ((at = match(other)) != std::string::npos) {
+                                owner = &other;
+                                break;
+                            }
+                        }
+                    }
+                    if (at == std::string::npos) continue;  // 入った記録がない（捨てられた・前のファイル）
+                    const OpenScope closed = (*owner)[at];
+                    const bool selected = s.inSelectedScope(*owner);
+                    owner->resize(at);  // 閉じ忘れた内側も一緒に閉じる
+                    if (!visible || !selected) continue;
+                    const double microseconds =
+                        view.tick != 0 && closed.tick != 0 && view.tick >= closed.tick
+                            ? static_cast<double>(view.tick - closed.tick) /
+                                  s.formatter.timeBase().ticksPerNanosecond / 1000.0
+                            : -1.0;
+                    s.formatter.setContext(s.scopePath(*owner), fiber);
+                    s.formatter.appendScope(line, view.tick, s.currentFrame, site, closed.name, closed.args, thread,
+                                            false, microseconds);
+                }
             } else {
-                const size_t used = static_cast<size_t>(view.payload - reinterpret_cast<const unsigned char*>(header));
-                s.formatter.appendBatch(line, view.tick, s.currentFrame, entry.site->site, view.payload,
-                                        header->size > used ? header->size - used : 0, thread, s.batchRows);
+                if (!shown || !s.inSelectedScope(stack)) continue;
+                s.formatter.setContext(s.scopePath(stack), fiber);
+                if (entry.kind == EntryKind::Record) {
+                    s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, site, view.payload, thread);
+                } else {
+                    const size_t used =
+                        static_cast<size_t>(view.payload - reinterpret_cast<const unsigned char*>(header));
+                    s.formatter.appendBatch(line, view.tick, s.currentFrame, site, view.payload,
+                                            header->size > used ? header->size - used : 0, thread, s.batchRows);
+                }
             }
         }
         if (!s.contains.empty() && line.find(s.contains) == std::string::npos) continue;

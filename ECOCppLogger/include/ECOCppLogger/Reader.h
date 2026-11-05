@@ -24,9 +24,10 @@ struct ViewFilter {
     const char* types = nullptr;
     const char* excludeTypes = nullptr;
     const char* contains = nullptr;      // この文字列を含む行だけ
+    const char* scopes = nullptr;        // このスコープ（ECO_SCOPE の名前の最初の語）の中の行だけ
     uint64_t firstFrame = 0;             // フレームの範囲（firstFrame〜lastFrame。0〜UINT64_MAX なら全部）
     uint64_t lastFrame = UINT64_MAX;
-    uint32_t batchRows = 0;              // 文章で、まとめ書きの塊ごとに出す件数（0 なら全部）
+    uint32_t batchRows = 0;              // まとめ書きの塊ごとに出す件数（0 なら全部）
     bool fullPath = false;               // src をソースのフルパスで
 };
 

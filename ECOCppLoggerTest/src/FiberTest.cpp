@@ -60,4 +60,56 @@ TEST(Fiber, LogsGoToTheThreadTheFiberRunsOn) {
     EXPECT_NE(after->find("\"th\":\"threadB\""), std::string::npos) << *after;
 }
 
+namespace {
+
+constexpr uint64_t kJobFiber = 7;
+
+void CALLBACK jobFiberMain(void*) {
+    {
+        ECO_SCOPE("Job {id}", 42);
+        ECO_LOG_INFO("job started");
+        SwitchToFiber(g_returnTo);  // 中断（次はスレッドB で続きから走る）
+        ECO_LOG_INFO("job resumed");
+    }
+    SwitchToFiber(g_returnTo);
+}
+
+}  // namespace
+
+TEST(Fiber, ScopesFollowTheFiberAcrossThreads) {
+    lgtest::TestConfig test;
+    lgtest::Session session(test.config);
+    void* fiber = nullptr;
+    std::thread([&] {
+        lg::setThreadName("threadA");
+        g_returnTo = ConvertThreadToFiber(nullptr);
+        fiber = CreateFiber(0, jobFiberMain, nullptr);
+        lg::onFiberSwitch(kJobFiber);  // ファイバーの仕組みが、切り替えるたびに呼ぶ
+        SwitchToFiber(fiber);
+        lg::onFiberSwitch(0);
+        ECO_LOG_INFO("threadA idle");
+        ConvertFiberToThread();
+    }).join();
+    std::thread([&] {
+        lg::setThreadName("threadB");
+        g_returnTo = ConvertThreadToFiber(nullptr);
+        lg::onFiberSwitch(kJobFiber);
+        SwitchToFiber(fiber);
+        lg::onFiberSwitch(0);
+        ConvertFiberToThread();
+    }).join();
+    DeleteFiber(fiber);
+    const auto lines = session.lines();
+    const std::string* resumed = lgtest::findContaining(lines, "\"msg\":\"job resumed\"");
+    ASSERT_NE(resumed, nullptr);
+    EXPECT_NE(resumed->find("\"th\":\"threadB\",\"fiber\":7,\"scope\":\"Job 42\""), std::string::npos) << *resumed;
+    const std::string* idle = lgtest::findContaining(lines, "\"msg\":\"threadA idle\"");
+    ASSERT_NE(idle, nullptr);
+    EXPECT_EQ(idle->find("\"scope\""), std::string::npos) << *idle;  // ファイバーが離れたスレッドには残らない
+    const std::string* exit = lgtest::findContaining(lines, "\"scope_event\":\"exit\"");
+    ASSERT_NE(exit, nullptr);
+    EXPECT_NE(exit->find("\"th\":\"threadB\""), std::string::npos) << *exit;
+    EXPECT_NE(exit->find("\"msg\":\"Job 42\""), std::string::npos) << *exit;
+}
+
 #endif

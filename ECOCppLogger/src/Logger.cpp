@@ -110,6 +110,29 @@ void dumpHistory(const char* reason) {
     detail::writer().dumpHistory(reason ? reason : "");
 }
 
+void onFiberSwitch(uint64_t fiberId) noexcept {
+    // 間引きの情報の場所にファイバーの ID を入れた1件（必ず残す）。
+    ThreadBuffer* buffer = detail::threadBuffer();
+    const bool withTime = detail::recordTime();
+    const size_t size = sizeof(RecordHeader) + (withTime ? 8 : 0) + 8;
+    unsigned char* out = buffer->reserve(size, true);
+    if (!out) {
+        buffer->countDrop();
+        return;
+    }
+    const RecordHeader header{static_cast<uint16_t>(size), RecordKind::FiberSwitch,
+                              static_cast<uint8_t>((withTime ? kRecordHasTick : 0) | kRecordHasAux), 0};
+    memcpy(out, &header, sizeof(header));
+    unsigned char* cursor = out + sizeof(header);
+    if (withTime) {
+        const uint64_t tick = ticks();
+        memcpy(cursor, &tick, 8);
+        cursor += 8;
+    }
+    memcpy(cursor, &fiberId, 8);
+    buffer->commit();
+}
+
 uint64_t frame() noexcept {
     return detail::g_frame.load(std::memory_order_relaxed);
 }

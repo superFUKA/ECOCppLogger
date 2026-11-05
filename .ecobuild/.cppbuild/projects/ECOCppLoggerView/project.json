@@ -1,0 +1,27 @@
+{
+  "data": {
+    "dependencies": {
+      "fcfcc4ae59cc4b28b29fd4a9699bc009": {
+        "kind": "project",
+        "values": {
+          "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
+          "project_type": "static_library"
+        }
+      }
+    },
+    "guid": "5dec2d52-c892-4412-b1b6-07b66d890e99",
+    "initial_type": "executable",
+    "name": "ECOCppLoggerView",
+    "project_headers": [],
+    "source_directories": [
+      "src",
+      "include"
+    ],
+    "system_headers": [],
+    "types": {
+      "executable": "executable-8848ded3be73bc6bd820244b1cec0b6b459348f6dbd4e312ad6f2805afd0666b.json"
+    }
+  },
+  "kind": "project",
+  "schema_version": 5
+}

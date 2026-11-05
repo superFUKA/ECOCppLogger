@@ -10,6 +10,9 @@ namespace eco::log::detail {
 
 void installCrashHandler();
 
+// std::set_terminate は MSVC ではスレッドごとに効くので、ログを書くスレッドごとに入れる（ThreadBuffer を作るとき）。
+void installThreadTerminateHandler();
+
 // Logger.cpp が実装する：落ちた理由と、crash の行に足す JSON（"," で始まる "key":value の並び）を受け取って書き出す。
 void emergencyFlush(std::string_view reason, const std::string& extraJson) noexcept;
 

@@ -1,5 +1,6 @@
 #include "CrashHandler.h"
 
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <exception>
@@ -20,6 +21,7 @@ namespace eco::log::detail {
 namespace {
 
 std::terminate_handler g_previousTerminate = nullptr;
+std::atomic<bool> g_installed{false};
 
 #if defined(_WIN32)
 
@@ -207,7 +209,14 @@ void installCrashHandler() {
         std::signal(SIGSEGV, onSignal);
         std::signal(SIGFPE, onSignal);
         std::signal(SIGILL, onSignal);
+        g_installed.store(true);
     });
+}
+
+void installThreadTerminateHandler() {
+    if (g_installed.load() && std::get_terminate() != onTerminate) {
+        std::set_terminate(onTerminate);
+    }
 }
 
 }  // namespace eco::log::detail

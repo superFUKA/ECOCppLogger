@@ -371,9 +371,11 @@ void Backend::emitStats(bool emergency) {
             const std::uint64_t written = slot.epoch.load(std::memory_order_acquire);
             double minimum = last;
             double maximum = last;
+            // 終わった期間（epoch）の値は [epoch & 1] にある。持ち主が次の期間へ進んでいても（written == epoch + 1）、
+            // 次の期間は反対側に書くので、こちらはそのまま残っている。
             if (written == epoch || written == epoch + 1) {
-                minimum = slot.minimum[written & 1].load(std::memory_order_relaxed);
-                maximum = slot.maximum[written & 1].load(std::memory_order_relaxed);
+                minimum = slot.minimum[epoch & 1].load(std::memory_order_relaxed);
+                maximum = slot.maximum[epoch & 1].load(std::memory_order_relaxed);
             }
             StatTotal& total = totals[std::string_view(site->name)];
             if (total.threads == 0) {

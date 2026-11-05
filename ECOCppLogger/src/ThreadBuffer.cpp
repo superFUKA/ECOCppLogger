@@ -4,6 +4,8 @@
 #include <bit>
 #include <new>
 
+#include "CrashHandler.h"
+
 namespace eco::log {
 
 namespace {
@@ -109,6 +111,7 @@ ThreadBuffer* createThreadBuffer() {
     ThreadBuffer* buffer = Registry::instance().create(g_threadBufferBytes.load(std::memory_order_relaxed));
     t_buffer = buffer;
     t_retirer.buffer = buffer;
+    installThreadTerminateHandler();
     return buffer;
 }
 

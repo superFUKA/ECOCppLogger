@@ -175,6 +175,49 @@ TEST(LoggerDeathTest, UncaughtExceptionWritesWhat) {
     EXPECT_NE(crash->find("\"exception\":\"boom\""), std::string::npos) << *crash;
 }
 
+// 大量にログを出している最中に、範囲外アクセスの例外（vector::at の std::out_of_range）が捕まらずに落ちる。
+TEST(LoggerDeathTest, OutOfRangeDuringHeavyLogging) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    const auto config = crashConfig();
+    std::error_code error;
+    std::filesystem::remove_all(config.directory, error);
+    EXPECT_DEATH(
+        {
+            eco::log::start(config);
+            std::atomic<bool> stopLogging{false};
+            std::vector<std::thread> loggers;
+            for (int t = 0; t < 4; ++t) {
+                loggers.emplace_back([t, &stopLogging] {
+                    for (int i = 0; !stopLogging.load(); ++i) {
+                        ECO_LOG_DEBUG("heavy {} {}", t, i);
+                        ECO_STAT("heavy.value", i);
+                    }
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::thread([] {
+                std::vector<int> values(10);
+                const std::size_t index = 10;
+                ECO_LOG_INFO("about to read index {} of {}", index, values.size());
+                volatile int value = values.at(index);  // 捕まえない
+                (void)value;
+            }).join();
+        },
+        "");
+    const auto lines = crashLog(config);
+    EXPECT_GT(countContaining(lines, "\"msg\":\"heavy "), 1000u);
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"about to read index 10 of 10\""), 1u);
+    EXPECT_EQ(countContaining(lines, "\"stat\":\"heavy.value\""), 1u);
+    const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
+    ASSERT_NE(crash, nullptr);
+    EXPECT_NE(crash->find("\"exception\":\"invalid vector subscript\""), std::string::npos) << *crash;
+    EXPECT_NE(crash->find("vector<int,std::allocator<int> >::at"), std::string::npos) << *crash;
+    // 集計の最小・最大は、その期間に書いた値の範囲の中にある
+    const std::string* stat = findContaining(lines, "\"stat\":\"heavy.value\"");
+    ASSERT_NE(stat, nullptr);
+    EXPECT_NE(stat->find("\"min\":0,"), std::string::npos) << *stat;
+}
+
 TEST(LoggerDeathTest, AccessViolationWritesPendingRecords) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     const auto config = crashConfig();

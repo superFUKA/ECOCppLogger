@@ -1,132 +1,100 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <iterator>
 #include <thread>
 
 #include "ECOCppLogger/ECOCppLogger.h"
 #include "ECOCppLogger/Reader.h"
 #include "TestSession.h"
 
-using eco::log::Level;
-using eco::log::ViewFormat;
-using eco::log::test::countContaining;
-using eco::log::test::findContaining;
-using eco::log::test::readLines;
-using eco::log::test::Session;
-using eco::log::test::testConfig;
+using lgtest::countContaining;
+using lgtest::findContaining;
+using lgtest::readLines;
+using lgtest::readText;
+using lgtest::Session;
+using lgtest::TestConfig;
 
 TEST(Reader, WritesHumanReadableText) {
-    std::filesystem::path file;
+    TestConfig test;
+    std::string file;
     {
-        Session session;
-        eco::log::setThreadName("main");
+        Session session(test.config);
+        lg::setThreadName("main");
         ECO_FRAME();
-        ECO_LOG_WARN("hp が範囲外 hp={} max={}", -5, 100);
-        file = eco::log::currentFile();
+        ECO_LOG(Warn | "physics", "hp が範囲外 hp={hp} max={max}", -5, 100);
+        file = session.file();
     }
-    const auto lines = readLines(file, ViewFormat::Text);
+    const auto lines = readLines(file.c_str(), lg::ViewFormat::Text);
     const std::string* line = findContaining(lines, "hp が範囲外");
     ASSERT_NE(line, nullptr);
-    // 13:20:34.729352 f1 WARN  [main] ReaderTest.cpp:24 Reader_WritesHumanReadableText_Test::TestBody: hp が範囲外 …
-    EXPECT_EQ((*line)[2], ':') << *line;
-    EXPECT_NE(line->find(" WARN  [main] ReaderTest.cpp:"), std::string::npos) << *line;
+    EXPECT_EQ((*line)[2], ':') << *line;  // 13:20:34.729352 …
+    EXPECT_NE(line->find(" WARN  #physics [main] ReaderTest.cpp:"), std::string::npos) << *line;
     EXPECT_NE(line->find(": hp が範囲外 hp=-5 max=100"), std::string::npos) << *line;
     EXPECT_EQ(countContaining(lines, " INFO  event=session.start"), 1u);
 }
 
-TEST(Reader, FiltersByLevelThreadAndText) {
-    std::filesystem::path file;
+TEST(Reader, FiltersByLevelThreadTypeTextAndFrame) {
+    TestConfig test;
+    std::string file;
     {
-        Session session;
-        eco::log::setThreadName("main");
-        ECO_LOG_INFO("info line");
-        ECO_LOG_ERROR("error line");
+        Session session(test.config);
+        lg::setThreadName("main");
+        ECO_FRAME();
+        const uint64_t frame = lg::frame();
+        ECO_LOG_INFO("info line {f}", frame);
+        ECO_LOG(Error | "physics", "error line");
+        ECO_FRAME();
+        ECO_LOG_INFO("next frame");
         std::thread([] {
-            eco::log::setThreadName("worker");
+            lg::setThreadName("worker");
             ECO_LOG_ERROR("worker error");
         }).join();
-        file = eco::log::currentFile();
+        file = session.file();
     }
-    eco::log::ViewFilter filter;
-    filter.level = Level::Error;
-    const std::string errors = eco::log::readLog(file, ViewFormat::Text, filter);
-    EXPECT_EQ(errors.find("info line"), std::string::npos);
-    EXPECT_NE(errors.find("error line"), std::string::npos);
-    EXPECT_NE(errors.find("worker error"), std::string::npos);
+    lg::ViewFilter errors;
+    errors.level = lg::Level::Error;
+    const std::string errorText = readText(file.c_str(), lg::ViewFormat::Text, errors);
+    EXPECT_EQ(errorText.find("info line"), std::string::npos);
+    EXPECT_NE(errorText.find("error line"), std::string::npos);
+    EXPECT_NE(errorText.find("worker error"), std::string::npos);
 
-    filter.thread = "worker";
-    const std::string worker = eco::log::readLog(file, ViewFormat::Text, filter);
-    EXPECT_EQ(worker.find("error line"), std::string::npos);
-    EXPECT_NE(worker.find("worker error"), std::string::npos);
+    lg::ViewFilter worker;
+    worker.threads = "worker";
+    const std::string workerText = readText(file.c_str(), lg::ViewFormat::Text, worker);
+    EXPECT_EQ(workerText.find("error line"), std::string::npos);
+    EXPECT_NE(workerText.find("worker error"), std::string::npos);
 
-    eco::log::ViewFilter text;
+    lg::ViewFilter physics;
+    physics.types = "physics";
+    const std::string physicsText = readText(file.c_str(), lg::ViewFormat::Text, physics);
+    EXPECT_NE(physicsText.find("error line"), std::string::npos);
+    EXPECT_EQ(physicsText.find("info line"), std::string::npos);
+    EXPECT_EQ(physicsText.find("session.start"), std::string::npos);  // event も型として外れる
+
+    lg::ViewFilter text;
     text.contains = "info";
-    const std::string found = eco::log::readLog(file, ViewFormat::Text, text);
+    const std::string found = readText(file.c_str(), lg::ViewFormat::Text, text);
     EXPECT_NE(found.find("info line"), std::string::npos);
     EXPECT_EQ(found.find("error line"), std::string::npos);
 }
 
-namespace {
-ECO_LOG_TYPE(AiLog, "ai");
-}
-
-TEST(Reader, FiltersByLogType) {
-    std::filesystem::path file;
-    {
-        Session session;
-        ECO_LOG_INFO("plain");
-        ECO_LOG_TYPED("physics", Level::Warn, "penetration depth={}", 0.25);
-        ECO_LOG_TYPED(AiLog, Level::Debug, "path {} steps", 12);
-        ECO_STAT("typed.stat", 1);
-        eco::log::flushStats();
-        file = eco::log::currentFile();
-    }
-    const auto all = readLines(file);
-    const std::string* physics = findContaining(all, "penetration");
-    ASSERT_NE(physics, nullptr);
-    EXPECT_NE(physics->find("\"lv\":\"warn\",\"type\":\"physics\",\"th\":"), std::string::npos) << *physics;
-    const std::string* plain = findContaining(all, "\"msg\":\"plain\"");
-    ASSERT_NE(plain, nullptr);
-    EXPECT_EQ(plain->find("\"type\""), std::string::npos) << *plain;  // 型なしは書かない
-
-    eco::log::ViewFilter only;
-    only.types = {"physics", "ai"};
-    const std::string typed = eco::log::readLog(file, ViewFormat::Text, only);
-    EXPECT_NE(typed.find("WARN  #physics ["), std::string::npos) << typed;
-    EXPECT_NE(typed.find("DEBUG #ai ["), std::string::npos) << typed;
-    EXPECT_EQ(typed.find("plain"), std::string::npos);
-    EXPECT_EQ(typed.find("typed.stat"), std::string::npos);
-    EXPECT_EQ(typed.find("session.start"), std::string::npos);
-
-    eco::log::ViewFilter exclude;
-    exclude.excludeTypes = {"ai", "event"};
-    const std::string rest = eco::log::readLog(file, ViewFormat::Text, exclude);
-    EXPECT_NE(rest.find("plain"), std::string::npos);
-    EXPECT_NE(rest.find("penetration"), std::string::npos);
-    EXPECT_NE(rest.find("typed.stat"), std::string::npos);
-    EXPECT_EQ(rest.find("path 12 steps"), std::string::npos);
-    EXPECT_EQ(rest.find("session.start"), std::string::npos);
-}
-
 TEST(Reader, OmitsTimeWhenNotRecorded) {
-    auto config = testConfig();
-    config.recordTime = false;
-    config.recordFrame = false;
-    std::filesystem::path file;
+    TestConfig test;
+    test.config.recordTime = false;
+    std::string file;
     {
-        Session session(config);
-        ECO_FRAME();
+        Session session(test.config);
         for (int i = 0; i < 100; ++i) {
-            ECO_LOG_INFO("no time {}", i);
+            ECO_LOG_INFO("no time {i}", i);
         }
-        file = eco::log::currentFile();
+        file = session.file();
     }
-    const auto json = readLines(file);
+    const auto json = readLines(file.c_str());
     const std::string* line = findContaining(json, "\"msg\":\"no time 0\"");
     ASSERT_NE(line, nullptr);
-    EXPECT_EQ(line->rfind("{\"lv\":\"info\"", 0), 0u) << *line;  // "t" も "f" もない
-    // 同じスレッドの中の順番は保たれる
-    std::size_t next = 0;
+    EXPECT_EQ(line->rfind("{\"lv\":\"info\"", 0), 0u) << *line;
+    size_t next = 0;
     for (const auto& each : json) {
         if (each.find("\"msg\":\"no time ") != std::string::npos) {
             EXPECT_NE(each.find("\"msg\":\"no time " + std::to_string(next) + "\""), std::string::npos) << each;
@@ -134,38 +102,44 @@ TEST(Reader, OmitsTimeWhenNotRecorded) {
         }
     }
     EXPECT_EQ(next, 100u);
-    const auto text = readLines(file, ViewFormat::Text);
+    const auto text = readLines(file.c_str(), lg::ViewFormat::Text);
     const std::string* textLine = findContaining(text, "no time 0");
     ASSERT_NE(textLine, nullptr);
     EXPECT_EQ(textLine->rfind("--:--:--.------ INFO ", 0), 0u) << *textLine;
 }
 
 TEST(Reader, ReadsAFileWhileItIsBeingWritten) {
-    Session session;
+    TestConfig test;
+    Session session(test.config);
     for (int i = 0; i < 100; ++i) {
-        ECO_LOG_INFO("live {}", i);
+        ECO_LOG_INFO("live {i}", i);
     }
-    eco::log::flush();
-    // 動いている最中のファイルを、少しずつ（書きかけで切れていても）読む
-    std::ifstream input(eco::log::currentFile(), std::ios::binary);
+    lg::writeOut();
+    std::ifstream input(lgtest::pathOf(session.file()), std::ios::binary);
     const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    eco::log::LogReader reader(ViewFormat::Json);
+    lg::LogReader reader(lg::ViewFormat::Json);
     std::string out;
-    for (std::size_t offset = 0; offset < bytes.size(); offset += 7) {
-        reader.feed(bytes.data() + offset, std::min<std::size_t>(7, bytes.size() - offset));
-        reader.take(out);
+    for (size_t offset = 0; offset < bytes.size(); offset += 7) {  // 書きかけで切れていても読める
+        reader.feed(bytes.data() + offset, std::min<size_t>(7, bytes.size() - offset));
+        size_t size = 0;
+        const char* text = reader.take(size);
+        out.append(text, size);
     }
     EXPECT_FALSE(reader.invalid());
-    std::size_t count = 0;
-    for (std::size_t at = out.find("\"msg\":\"live "); at != std::string::npos; at = out.find("\"msg\":\"live ", at + 1)) {
-        ++count;
-    }
-    EXPECT_EQ(count, 100u);
+    EXPECT_EQ(countContaining(lgtest::splitLines(out), "\"msg\":\"live "), 100u);
 }
 
 TEST(Reader, RejectsOtherFiles) {
-    eco::log::LogReader reader(ViewFormat::Json);
+    lg::LogReader reader(lg::ViewFormat::Json);
     const std::string text = "{\"not\":\"ecolog\"}\n";
     reader.feed(text.data(), text.size());
     EXPECT_TRUE(reader.invalid());
+}
+
+TEST(Reader, FindsTheLatestLog) {
+    TestConfig test;
+    Session session(test.config);
+    const char* latest = lg::latestLog(test.directory.c_str());
+    ASSERT_NE(latest, nullptr);
+    EXPECT_EQ(std::string(latest), session.file());
 }

@@ -1,7 +1,7 @@
 {
   "data": {
     "dependencies": {
-      "3b0a6ba1048e425db80483bd4c1fbd12": {
+      "6a6f13c2b49d4788b7c62b60aacbce03": {
         "kind": "project",
         "values": {
           "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
@@ -9,7 +9,7 @@
         }
       }
     },
-    "guid": "caed90fb-5f79-4600-b711-926c60c43b0e",
+    "guid": "2a15a8e9-88c9-437e-87b7-5a85f4e52085",
     "initial_type": "executable",
     "name": "ECOCppLoggerBench",
     "project_headers": [],

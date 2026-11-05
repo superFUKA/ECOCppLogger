@@ -1,68 +1,81 @@
 #pragma once
 
-// .ecolog ファイルの形（書く側：Logger.cpp、読む側：Reader.cpp）。
+// .ecolog ファイルの形（書く側：Writer、読む側：Reader）。
 //
-// 動いている間は文字列にせず、スレッドのリングバッファの中身をほぼそのまま書き写す。見るときに Reader が
+// 動いている間は文字列にせず、スレッドのバッファの中身をそのまま書き写す。見るときに Reader が
 // 人向けの文章・LLM 向けの JSON Lines に直す。
 //
-//   ファイル = 頭（Magic・版） + フレームの並び
-//   フレーム = FrameHeader（種類・中身の大きさ） + 中身
+//   ファイル = kMagic（8）＋ kVersion（4）＋ フレームの並び
+//   フレーム = FrameHeader（種類・中身の大きさ）＋ 中身
 //
-//   Clock    ：時刻の換算（ticks → UNIX 時刻）。始めと、集計のたび・落ちたときに書く（最後のものが一番正確）
-//   SiteDef  ：呼び出し位置（番号 → 書式・ファイル・行・関数・引数の型）。ファイルで初めて出たときに書く
+//   Clock    ：時刻の換算（ticks → UNIX 時刻）。始め・集計のたび・落ちたときに書く（読む側は最後のものを使う）
 //   TypeDef  ：ログの型の番号（このファイルの中の連番）→ 名前。その型が初めて出たときに書く
-//   ThreadDef：スレッドの番号 → 名前
-//   Block    ：あるスレッドのリングバッファの中身（RecordHeader＋引数 の並び。詰め物を含むことがある）そのまま
-//   Event    ：めったにないもの（集計・最近の値・捨てた数・落ちた・始め・終わり）。時刻＋JSON の中身（"t" を除く）
+//   SiteDef  ：呼び出し位置の番号 → 重さ・型・書式・ファイル・行・関数・引数の形。ファイルで初めて出たときに書く
+//   ThreadDef：スレッドの番号 → OS のスレッド ID・名前（名前が変わったら書き直す）
+//   Block    ：あるスレッドのバッファの中身（記録の並び）をそのまま
+//   Event    ：めったにないもの（集計・始め・終わり・落ちた・捨てた 等）。時刻＋JSON の中身（"t" を除く）
 
-#include <cstdint>
+#include <stdint.h>
 
-namespace eco::log::detail::file {
+namespace lg::detail::file {
 
 inline constexpr char kMagic[8] = {'E', 'C', 'O', 'L', 'O', 'G', '\0', '\1'};
-// 2：記録の頭を 8 バイトに（RecordHeader）、まとめ書き・フレームの印
-// 3：ログの型（TypeDef。SiteDef が型の番号を持つ）
-inline constexpr std::uint32_t kVersion = 3;
+inline constexpr uint32_t kVersion = 1;
 
-enum class FrameType : std::uint32_t {
+enum class FrameType : uint32_t {
     Clock = 1,
-    SiteDef = 2,
-    ThreadDef = 3,
-    Block = 4,
-    Event = 5,
-    TypeDef = 6,
+    TypeDef = 2,
+    SiteDef = 3,
+    ThreadDef = 4,
+    Block = 5,
+    Event = 6,
 };
 
 struct FrameHeader {
     FrameType type;
-    std::uint32_t size;  // 中身のバイト数（FrameHeader を含まない）
+    uint32_t size;  // 中身のバイト数（FrameHeader を含まない）
 };
 
 struct ClockPayload {
-    std::uint64_t tick;
-    std::int64_t unixNanoseconds;
+    uint64_t tick;
+    int64_t unixNanoseconds;
     double ticksPerNanosecond;
-    std::int32_t utcOffsetMinutes;
-    std::uint32_t reserved;
+    int32_t utcOffsetMinutes;
+    uint32_t reserved;
 };
 
-// SiteDef の中身：SiteDefPayload、引数の型（argCount バイト）、書式・ファイル・関数（それぞれ uint32 の長さ＋バイト列）
+// TypeDef の中身：uint32 の番号＋名前のバイト列
+
+// SiteDef の中身：SiteDefPayload、引数の形（tagCount バイト）、書式・ファイル・関数、
+// ECO_LOG_FIELDS の型の項目名（structCount 個）（文字列はそれぞれ uint32 の長さ＋バイト列）
 struct SiteDefPayload {
-    std::uint64_t id;  // 記録の頭の site（呼び出し位置の番号）
-    std::uint64_t samplingValue;
-    std::uint32_t line;
-    std::uint8_t level;
-    std::uint8_t sampling;
-    std::uint8_t argCount;
-    std::uint8_t reserved;
-    std::uint32_t type;  // ログの型の番号（TypeDef）
-    std::uint32_t reserved2;
+    uint32_t id;
+    uint32_t line;
+    uint64_t samplingValue;
+    uint32_t type;  // TypeDef の番号
+    uint8_t level;
+    uint8_t sampling;
+    uint8_t argCount;
+    uint8_t structCount;
+    uint16_t tagCount;
+    uint16_t reserved;
+    uint32_t reserved2;
 };
 
-// TypeDef の中身：uint32 の番号（このファイルの中で 1 からの連番）＋型の名前のバイト列
+// ThreadDef の中身：ThreadDefPayload＋名前のバイト列
+struct ThreadDefPayload {
+    uint32_t index;
+    uint32_t reserved;
+    uint64_t osThreadId;
+};
 
-// ThreadDef の中身：uint32 の番号＋名前のバイト列
-// Block の中身：uint32 のスレッドの番号＋uint32（予備）＋リングバッファのバイト列
-// Event の中身：uint64 の tick＋JSON の中身のバイト列（例 "lv":"stat","stat":"x",...）
+// Block の中身：BlockPayload＋記録の並び
+struct BlockPayload {
+    uint32_t thread;
+    uint32_t reserved;
+    uint64_t drainTick;  // 書き写した時刻（時刻のない記録を並べるのに使う）
+};
 
-}  // namespace eco::log::detail::file
+// Event の中身：uint64 の時刻＋JSON の中身のバイト列
+
+}  // namespace lg::detail::file

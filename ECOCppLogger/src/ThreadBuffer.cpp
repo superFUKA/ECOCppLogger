@@ -4,73 +4,139 @@
 #include <bit>
 #include <new>
 
-#include "CrashHandler.h"
-#include "ECOCppLogger/Logger.h"
+#include "Crash.h"
+#include "Registry.h"
 
-namespace eco::log {
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
-namespace {
+namespace lg {
 
-std::atomic<std::size_t> g_threadBufferBytes{std::size_t{1} << 20};
-
-// スレッドが終わるときにバッファを「終わった」にする（バッファ自体は裏のスレッドが読み切ってから片付ける）。
-struct Retirer {
-    ThreadBuffer* buffer = nullptr;
-    ~Retirer() {
-        if (buffer) {
-            buffer->retired.store(true, std::memory_order_release);
-        }
-        detail::t_buffer = nullptr;
-    }
-};
-
-thread_local Retirer t_retirer;
-
-}  // namespace
-
-HistoryRing::HistoryRing(std::size_t capacity)
-    : mask_(std::bit_ceil(std::max<std::size_t>(capacity, 1)) - 1), entries_(new HistoryEntry[mask_ + 1]) {}
-
-HistoryRing::~HistoryRing() {
-    delete[] entries_;
-}
-
-ThreadBuffer::ThreadBuffer(std::size_t capacityBytes, std::uint32_t index)
-    : capacity_(std::bit_ceil(std::max<std::size_t>(capacityBytes, 4096))), index_(index) {
+ThreadBuffer::ThreadBuffer(size_t capacityBytes, uint32_t reservePercent, uint32_t index, uint64_t osThreadId)
+    : capacity_(std::bit_ceil(std::max<size_t>(capacityBytes, 4096))), index_(index), osThreadId_(osThreadId) {
     mask_ = capacity_ - 1;
-    data_ = static_cast<std::byte*>(::operator new(capacity_, std::align_val_t{64}));
+    normalLimit_ = capacity_ - capacity_ * std::min<uint32_t>(reservePercent, 90) / 100;
+    data_ = static_cast<unsigned char*>(::operator new(capacity_, std::align_val_t{64}));
 }
 
 ThreadBuffer::~ThreadBuffer() {
     ::operator delete(data_, std::align_val_t{64});
-    for (auto& entry : chunks_) {
-        delete entry.load(std::memory_order_relaxed);
+    for (SiteState* chunk : stateChunks_) {
+        delete[] chunk;
+    }
+    for (auto& chunk : statChunks_) {
+        delete chunk.load(std::memory_order_relaxed);
     }
 }
 
-StatChunk* ThreadBuffer::allocateChunk(std::size_t chunkIndex) {
-    auto* chunk = new StatChunk();
-    chunks_[chunkIndex].store(chunk, std::memory_order_release);
+StatChunk* ThreadBuffer::createStatChunk(uint32_t chunkIndex) noexcept {
+    auto* chunk = new (std::nothrow) StatChunk();
+    statChunks_[chunkIndex].store(chunk, std::memory_order_release);
     return chunk;
 }
 
+ThreadBuffer::SiteState* ThreadBuffer::createStateChunk(uint32_t site) noexcept {
+    SiteState*& chunk = stateChunks_[(site / kStateChunkSize) % kStateChunks];
+    chunk = new (std::nothrow) SiteState[kStateChunkSize]();
+    if (!chunk) {
+        static thread_local SiteState fallback[kStateChunkSize];  // 取れなければ使い捨て（間引きが不正確になるだけ）
+        return fallback;
+    }
+    return chunk;
+}
+
+namespace detail {
+
+#if ECO_LOG_TLS_SLOT
+namespace {
+DWORD g_tlsIndex = TLS_OUT_OF_INDEXES;
+}
+
+// TEB の TlsSlots は gs:[0x1480] から 64 個（それより後ろの番号は別の場所なので、使えなければ遅い道）。
+uint32_t g_tlsSlotOffset = [] {
+    g_tlsIndex = TlsAlloc();
+    return g_tlsIndex < 64 ? static_cast<uint32_t>(0x1480 + g_tlsIndex * 8) : 0u;
+}();
+#endif
+
+namespace {
+
+uint64_t currentOsThreadId() {
+#if defined(_WIN32)
+    return GetCurrentThreadId();
+#else
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
+#endif
+}
+
+// スレッドが終わるときにバッファを「終わった」にする（バッファ自体は書き出す側が読み切ってから片付ける）。
+struct ThreadHolder {
+    ThreadBuffer* buffer = nullptr;
+    ~ThreadHolder() {
+        if (buffer) {
+            buffer->retired.store(true, std::memory_order_release);
+        }
+#if ECO_LOG_TLS_SLOT
+        if (g_tlsIndex != TLS_OUT_OF_INDEXES) {
+            TlsSetValue(g_tlsIndex, nullptr);
+        }
+#endif
+        buffer = nullptr;
+    }
+};
+
+thread_local ThreadHolder t_holder;
+
+}  // namespace
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+ThreadBuffer* threadBufferSlow() noexcept {
+    ThreadHolder& holder = t_holder;  // 非インラインなので、毎回今のスレッドのものを読む
+    if (!holder.buffer) {
+        holder.buffer = Registry::instance().create(currentOsThreadId());
+        installThreadCrashHandler();  // std::set_terminate はスレッドごと（MSVC）
+#if ECO_LOG_TLS_SLOT
+        if (g_tlsIndex != TLS_OUT_OF_INDEXES) {
+            TlsSetValue(g_tlsIndex, holder.buffer);
+        }
+#endif
+    }
+    return holder.buffer;
+}
+
+// ---- 台帳 ---------------------------------------------------------------------------------------------
+
 Registry& Registry::instance() {
-    // わざと消さない：静的な破棄の後・クラッシュ中にも使われるため。
+    // わざと消さない：静的な破棄の後・落ちている最中にも使われるため。
     static Registry* registry = new Registry();
     return *registry;
 }
 
-ThreadBuffer* Registry::create(std::size_t capacityBytes) {
-    std::lock_guard lock(mutex);
-    auto buffer = std::make_unique<ThreadBuffer>(capacityBytes, nextThreadIndex_++);
-    buffer->name = "T" + std::to_string(buffer->index());
-    ThreadBuffer* raw = buffer.get();
-    buffers_.push_back(std::move(buffer));
-    return raw;
+void Registry::setBufferSettings(size_t bytes, uint32_t reservePercent) {
+    std::lock_guard lock(mutex_);
+    bufferBytes_ = bytes;
+    reservePercent_ = reservePercent;
+}
+
+ThreadBuffer* Registry::create(uint64_t osThreadId) {
+    std::lock_guard lock(mutex_);
+    const uint32_t index = nextThreadIndex_++;
+    buffers_.push_back(std::make_unique<ThreadBuffer>(bufferBytes_, reservePercent_, index, osThreadId));
+    names_.push_back("T" + std::to_string(index));
+    return buffers_.back().get();
 }
 
 std::vector<Registry::Entry> Registry::snapshot(bool emergency) {
-    std::unique_lock lock(mutex, std::defer_lock);
+    std::unique_lock lock(mutex_, std::defer_lock);
     if (emergency) {
         (void)lock.try_lock();
     } else {
@@ -78,45 +144,50 @@ std::vector<Registry::Entry> Registry::snapshot(bool emergency) {
     }
     std::vector<Entry> result;
     result.reserve(buffers_.size());
-    for (auto& buffer : buffers_) {
-        result.push_back({buffer.get(), buffer->name});
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+        result.push_back({buffers_[i].get(), names_[i]});
     }
     return result;
 }
 
 void Registry::setName(ThreadBuffer* buffer, std::string_view name) {
-    std::lock_guard lock(mutex);
-    buffer->name = name;
+    std::lock_guard lock(mutex_);
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+        if (buffers_[i].get() == buffer) {
+            names_[i] = name;
+        }
+    }
+}
+
+std::string Registry::name(const ThreadBuffer* buffer) {
+    std::lock_guard lock(mutex_);
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+        if (buffers_[i].get() == buffer) return names_[i];
+    }
+    return {};
 }
 
 void Registry::removeRetired(const std::vector<ThreadBuffer*>& done) {
     if (done.empty()) {
         return;
     }
-    std::lock_guard lock(mutex);
-    std::erase_if(buffers_, [&](const std::unique_ptr<ThreadBuffer>& buffer) {
-        return std::find(done.begin(), done.end(), buffer.get()) != done.end();
-    });
-}
-
-std::uint32_t Registry::registerStat(StatSite& site) noexcept {
-    // 2つのスレッドが同時に初めて使っても、1つの番号に決まるようにする。
-    std::uint32_t expected = 0;
-    const std::uint32_t candidate = nextStatIndex_.fetch_add(1, std::memory_order_relaxed);
-    if (site.index.compare_exchange_strong(expected, candidate, std::memory_order_acq_rel)) {
-        return candidate;
+    std::lock_guard lock(mutex_);
+    for (size_t i = buffers_.size(); i-- > 0;) {
+        if (std::find(done.begin(), done.end(), buffers_[i].get()) != done.end()) {
+            buffers_.erase(buffers_.begin() + static_cast<std::ptrdiff_t>(i));
+            names_.erase(names_.begin() + static_cast<std::ptrdiff_t>(i));
+        }
     }
-    return expected;
 }
 
-std::uint32_t Registry::registerSite(const Site& site, SiteIdSlot& slot) noexcept {
+uint32_t Registry::registerSite(const Site& site, SiteIdSlot& slot) noexcept {
     std::lock_guard lock(siteMutex_);
-    std::uint32_t id = slot.load(std::memory_order_acquire);
+    uint32_t id = slot.load(std::memory_order_acquire);
     if (id != 0) {
         return id;  // ほかのスレッドが先に振った
     }
     id = nextSiteId_;
-    const std::size_t chunkIndex = id / kSiteChunkSize;
+    const size_t chunkIndex = id / kSiteChunkSize;
     if (chunkIndex >= kSiteChunks) {
         return 0;  // 多すぎる：このログは書かない
     }
@@ -131,8 +202,18 @@ std::uint32_t Registry::registerSite(const Site& site, SiteIdSlot& slot) noexcep
     return id;
 }
 
-const Site* Registry::siteById(std::uint32_t id) const noexcept {
-    const std::size_t chunkIndex = id / kSiteChunkSize;
+uint32_t Registry::registerStat(StatSite& site) noexcept {
+    std::lock_guard lock(siteMutex_);
+    uint32_t index = site.index.load(std::memory_order_relaxed);
+    if (index == 0 && nextStatIndex_ < kStatChunks * kStatChunkSlots) {
+        index = nextStatIndex_++;
+        site.index.store(index, std::memory_order_relaxed);
+    }
+    return index;
+}
+
+const Site* Registry::site(uint32_t id) const noexcept {
+    const size_t chunkIndex = id / kSiteChunkSize;
     if (chunkIndex >= kSiteChunks) {
         return nullptr;
     }
@@ -140,26 +221,10 @@ const Site* Registry::siteById(std::uint32_t id) const noexcept {
     return chunk ? chunk[id % kSiteChunkSize].load(std::memory_order_acquire) : nullptr;
 }
 
-namespace detail {
-
-HistoryRing* createHistory(StatSlot& slot, const StatSite& site) {
-    auto* ring = new HistoryRing(site.historyCapacity);
-    slot.history.store(ring, std::memory_order_release);
-    return ring;
-}
-
-void setThreadBufferBytes(std::size_t bytes) noexcept {
-    g_threadBufferBytes.store(bytes, std::memory_order_relaxed);
-}
-
-ThreadBuffer* createThreadBuffer() {
-    ThreadBuffer* buffer = Registry::instance().create(g_threadBufferBytes.load(std::memory_order_relaxed));
-    t_buffer = buffer;
-    t_retirer.buffer = buffer;
-    installThreadTerminateHandler();
-    return buffer;
+uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept {
+    return Registry::instance().registerSite(site, slot);
 }
 
 }  // namespace detail
 
-}  // namespace eco::log
+}  // namespace lg

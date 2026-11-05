@@ -2,33 +2,39 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <memory>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "FileFormat.h"
-#include "Output.h"
+#include "Format.h"
 
-namespace eco::log {
+namespace lg {
 
 namespace {
 
 namespace file = detail::file;
 
 constexpr std::string_view kAbout =
-    "JSON Lines decoded from an ECOCppLogger .ecolog file. t=local time (missing when record_time is false; "
-    "then lines are ordered per thread, and across threads only roughly), f=frame number, lv=level, th=thread, "
-    "src=file:line, fn=function, msg=message. sample=this site is sampled (n=call count, skipped=calls not logged "
-    "since the previous line; on change=written only when the value changed, change=0 is the first value). "
-    "lv=stat lines aggregate ECO_STAT/ECO_COUNT/ECO_SCOPE_TIME over period_ms: n=calls in the period, "
-    "total=calls since start, unit=us means durations in microseconds. lv=history lines list the most recent "
-    "values of ECO_HISTORY kept in memory, written on crash or dumpHistory(reason); points are "
-    "[f, ms before t, value], oldest first. event=dropped means the thread's buffer was full and that many "
-    "records were lost. event=crash has the reason, exception and stack. type=the kind of log given by the "
-    "program (e.g. physics, ai, assert); missing means a plain log. batch lines (ECO_LOG_BATCH) hold many entries "
-    "of one format: msg is the format, rows are the values of each entry in order, duration_us spans them.";
+    "JSON Lines decoded from an ECOCppLogger .ecolog file. t=local time (missing when record_time is false; then "
+    "lines keep the order within each thread, and across threads only roughly), f=frame number, lv=level, "
+    "type=kind of log given by the program (missing means a plain log), th=thread, src=file:line, fn=function, "
+    "msg=message, args=named values of the message, scope=nested ECO_SCOPE names the line is in (outer > inner), "
+    "fiber=fiber the thread was running, scope_event=enter/exit of a scope (us=time spent inside). sample=this site is sampled (n=call count, skipped=calls not "
+    "logged since the previous line, on change=written only when the value changed, change=0 is the first value). "
+    "batch=a loop logged in one block (rows=values of each iteration, us=time the block took, omitted=rows not shown). "
+    "event=session.start has run (id of this run), event=environment has the app, build, OS, CPU, memory and GPU, "
+    "event=info is a value given by lg::setInfo, event=thread maps a thread name to its OS thread id (tid). "
+    "event=dropped means the thread's buffer was full and that many records were lost. event=crash has the reason, "
+    "exceptions (outermost first), stack of the crashed thread, registers, threads (stacks of the other threads), "
+    "modules and minidump. event=stack is a stack written by a failed assert or lg::writeStack. lv=stat is a value "
+    "aggregated over ms milliseconds (n=count, avg/min/max/last/sum, per_s for counts, unit=us for times). "
+    "lv=history lists recent values of a stat (ago_ms=milliseconds before the dump, f=frame, v=value).";
 
-// 読んだ呼び出し位置（Site が指す文字列はここで持つ）。
 struct OwnedSite {
     Site site{};
     std::string format;
@@ -36,43 +42,50 @@ struct OwnedSite {
     std::string function;
     std::string type;
     std::vector<ArgTag> tags;
+    std::vector<std::string> structNames;
+    std::vector<const char*> structNamePointers;
 };
 
-// Event の型（絞り込み用）：集計・最近の値・それ以外。
-std::string_view eventType(std::string_view body) {
-    if (body.find("\"lv\":\"stat\"") != std::string_view::npos) return "stat";
-    if (body.find("\"lv\":\"history\"") != std::string_view::npos) return "history";
-    return "event";
+enum class EntryKind { Record, Batch, Frame, Event, ScopeEnter, ScopeExit, FiberSwitch };
+
+// 開いているスコープ（ECO_SCOPE）。
+struct OpenScope {
+    uint64_t token;
+    std::string name;  // 本文
+    std::string word;  // 最初の語（絞り込みに使う）
+    std::string args;  // 名前付きの値（JSON）
+    uint64_t tick;
+};
+
+struct Entry {
+    uint64_t order;  // 並べる時刻（時刻のない記録は書き写した時刻）
+    uint64_t tick;
+    EntryKind kind;
+    uint32_t thread;
+    const OwnedSite* site;
+    std::vector<uint64_t> record;  // 記録のバイト列（8 バイトにそろえて持つ）
+    std::string body;              // Event の中身
+    uint64_t frame = 0;            // Frame の印
+};
+
+std::vector<std::string> splitList(const char* text) {
+    std::vector<std::string> list;
+    if (!text) return list;
+    std::string_view rest = text;
+    while (!rest.empty()) {
+        const size_t comma = rest.find(',');
+        std::string_view item = rest.substr(0, comma);
+        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+        if (!item.empty()) list.emplace_back(item);
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+    }
+    return list;
 }
 
 bool listed(const std::vector<std::string>& list, std::string_view name) {
     return std::find(list.begin(), list.end(), name) != list.end();
 }
-
-bool typeSelected(const ViewFilter& filter, std::string_view type) {
-    return (filter.types.empty() || listed(filter.types, type)) && !listed(filter.excludeTypes, type);
-}
-
-// 記録の型での判定（書き出し先の絞り込みと同じ：まとめ書きは自分の型に加えて "batch" でもある）。
-bool recordSelected(const ViewFilter& filter, std::string_view type, bool batch) {
-    const bool included =
-        filter.types.empty() || listed(filter.types, type) || (batch && listed(filter.types, "batch"));
-    const bool excluded = listed(filter.excludeTypes, type) || (batch && listed(filter.excludeTypes, "batch"));
-    return included && !excluded;
-}
-
-enum class EntryKind { Record, Batch, Frame, Event };
-
-struct Entry {
-    std::uint64_t order;  // 並べる時刻（時刻のない記録は、書き写した時刻）
-    std::uint64_t tick;   // 時刻（0 ならなし）
-    EntryKind kind;
-    std::uint32_t thread;
-    const OwnedSite* site;
-    std::vector<std::uint64_t> record;  // 記録のバイト列（8 バイトにそろえて持つ）
-    std::string body;                   // Event の中身
-    std::uint64_t frame = 0;            // Frame の印のフレーム番号
-};
 
 Level eventLevel(std::string_view body) {
     if (body.find("\"lv\":\"fatal\"") != std::string_view::npos) return Level::Fatal;
@@ -81,8 +94,14 @@ Level eventLevel(std::string_view body) {
     return Level::Info;
 }
 
+std::string_view eventType(std::string_view body) {
+    if (body.find("\"lv\":\"stat\"") != std::string_view::npos) return "stat";
+    if (body.find("\"lv\":\"history\"") != std::string_view::npos) return "history";
+    return "event";
+}
+
 template <class T>
-T read(const char*& cursor) {
+T readAt(const char*& cursor) {
     T value;
     std::memcpy(&value, cursor, sizeof(T));
     cursor += sizeof(T);
@@ -91,8 +110,8 @@ T read(const char*& cursor) {
 
 std::string readString(const char*& cursor, const char* end) {
     if (end - cursor < 4) return {};
-    const auto length = read<std::uint32_t>(cursor);
-    if (static_cast<std::size_t>(end - cursor) < length) return {};
+    const auto length = readAt<uint32_t>(cursor);
+    if (static_cast<size_t>(end - cursor) < length) return {};
     std::string text(cursor, length);
     cursor += length;
     return text;
@@ -102,93 +121,190 @@ std::string readString(const char*& cursor, const char* end) {
 
 struct LogReader::State {
     ViewFormat format;
-    ViewFilter filter;
     detail::LineFormatter formatter;
+    Level level;
+    std::vector<std::string> threadNames;
+    std::vector<std::string> types;
+    std::vector<std::string> excludeTypes;
+    std::string contains;
+    uint64_t firstFrame;
+    uint64_t lastFrame;
+    uint32_t batchRows;
+
     std::string pending;
     bool headerRead = false;
     bool invalid = false;
-    std::unordered_map<std::uint64_t, std::unique_ptr<OwnedSite>> sites;
-    std::unordered_map<std::uint32_t, std::string> threads;
-    std::unordered_map<std::uint32_t, std::string> types;  // ログの型の番号 → 名前
+    std::unordered_map<uint32_t, std::unique_ptr<OwnedSite>> sites;
+    std::unordered_map<uint32_t, std::string> typeNames;
+    std::unordered_map<uint32_t, std::string> threads;
     std::vector<Entry> entries;
-    std::uint64_t currentFrame = 0;  // 時刻の順に並べたとき、最後に通った Frame の印
+    uint64_t currentFrame = 0;
+    std::vector<std::string> scopeFilter;
+    std::unordered_map<uint32_t, uint64_t> threadFiber;               // スレッドで今走っているファイバー
+    std::unordered_map<uint64_t, std::vector<OpenScope>> openScopes;  // ファイバー（なければスレッド）ごと
+    std::string message;
+    std::vector<std::string> pendingThreadLines;
+    std::unordered_set<std::string> knownThreadLines;
+    std::string out;
 
-    State(ViewFormat format_, ViewFilter filter_)
-        : format(format_), filter(std::move(filter_)),
+    State(ViewFormat format_, const ViewFilter& filter)
+        : format(format_),
           formatter(format_ == ViewFormat::Json ? detail::OutputFormat::Json : detail::OutputFormat::Text,
-                    filter.fullPath) {}
+                    filter.fullPath),
+          level(filter.level),
+          threadNames(splitList(filter.threads)),
+          types(splitList(filter.types)),
+          excludeTypes(splitList(filter.excludeTypes)),
+          contains(filter.contains ? filter.contains : ""),
+          firstFrame(filter.firstFrame),
+          lastFrame(filter.lastFrame),
+          batchRows(filter.batchRows),
+          scopeFilter(splitList(filter.scopes)) {}
 
-    void frame(file::FrameType type, const char* data, std::size_t size);
+    uint64_t contextOf(uint32_t thread) const {
+        auto fiber = threadFiber.find(thread);
+        return fiber != threadFiber.end() && fiber->second != 0 ? fiber->second : (uint64_t{1} << 63) | thread;
+    }
+
+    std::string scopePath(const std::vector<OpenScope>& stack) const {
+        std::string path;
+        for (const OpenScope& scope : stack) {
+            if (!path.empty()) path.append(" > ");
+            path.append(scope.name);
+        }
+        return path;
+    }
+
+    bool inSelectedScope(const std::vector<OpenScope>& stack) const {
+        if (scopeFilter.empty()) return true;
+        for (const OpenScope& scope : stack) {
+            if (listed(scopeFilter, scope.word)) return true;
+        }
+        return false;
+    }
+
+    bool typeSelected(std::string_view type, bool batch) const {
+        const bool included = types.empty() || listed(types, type) || (batch && listed(types, "batch"));
+        const bool excluded = listed(excludeTypes, type) || (batch && listed(excludeTypes, "batch"));
+        return included && !excluded;
+    }
+
+    void frame(file::FrameType type, const char* data, size_t size);
 };
 
-void LogReader::State::frame(file::FrameType type, const char* data, std::size_t size) {
+void LogReader::State::frame(file::FrameType type, const char* data, size_t size) {
     const char* cursor = data;
     const char* end = data + size;
     switch (type) {
     case file::FrameType::Clock: {
         if (size < sizeof(file::ClockPayload)) return;
-        const auto clock = read<file::ClockPayload>(cursor);
+        const auto clock = readAt<file::ClockPayload>(cursor);
         formatter.setTimeBase({clock.tick, clock.unixNanoseconds, clock.ticksPerNanosecond, clock.utcOffsetMinutes});
-        return;
-    }
-    case file::FrameType::SiteDef: {
-        if (size < sizeof(file::SiteDefPayload)) return;
-        const auto payload = read<file::SiteDefPayload>(cursor);
-        auto owned = std::make_unique<OwnedSite>();
-        if (static_cast<std::size_t>(end - cursor) < payload.argCount) return;
-        owned->tags.assign(reinterpret_cast<const ArgTag*>(cursor), reinterpret_cast<const ArgTag*>(cursor) + payload.argCount);
-        cursor += payload.argCount;
-        owned->format = readString(cursor, end);
-        owned->fileName = readString(cursor, end);
-        owned->function = readString(cursor, end);
-        auto type = types.find(payload.type);
-        owned->type = type != types.end() ? type->second : std::string(types::Log.name);
-        owned->tags.push_back(ArgTag::None);  // 空でも data() が使えるように
-        owned->site = Site{static_cast<Level>(payload.level), owned->format, owned->fileName.c_str(),
-                           owned->function.c_str(), payload.line, owned->tags.data(), payload.argCount,
-                           payload.sampling, payload.samplingValue, owned->type.c_str()};
-        sites[payload.id] = std::move(owned);
         return;
     }
     case file::FrameType::TypeDef: {
         if (size < 4) return;
-        const auto id = read<std::uint32_t>(cursor);
-        types[id] = std::string(cursor, end);
+        const auto id = readAt<uint32_t>(cursor);
+        typeNames[id] = std::string(cursor, end);
+        return;
+    }
+    case file::FrameType::SiteDef: {
+        if (size < sizeof(file::SiteDefPayload)) return;
+        const auto payload = readAt<file::SiteDefPayload>(cursor);
+        if (static_cast<size_t>(end - cursor) < payload.tagCount) return;
+        auto owned = std::make_unique<OwnedSite>();
+        owned->tags.assign(reinterpret_cast<const ArgTag*>(cursor),
+                           reinterpret_cast<const ArgTag*>(cursor) + payload.tagCount);
+        cursor += payload.tagCount;
+        owned->format = readString(cursor, end);
+        owned->fileName = readString(cursor, end);
+        owned->function = readString(cursor, end);
+        for (uint32_t i = 0; i < payload.structCount; ++i) {
+            owned->structNames.push_back(readString(cursor, end));
+        }
+        for (const std::string& names : owned->structNames) {
+            owned->structNamePointers.push_back(names.c_str());
+        }
+        auto typeName = typeNames.find(payload.type);
+        owned->type = typeName != typeNames.end() ? typeName->second : std::string(types::Log.name);
+        owned->tags.push_back(ArgTag::None);
+        owned->site = Site{static_cast<Level>(payload.level),
+                           owned->type.c_str(),
+                           owned->format.c_str(),
+                           owned->fileName.c_str(),
+                           owned->function.c_str(),
+                           payload.line,
+                           owned->tags.data(),
+                           payload.argCount,
+                           static_cast<Sampling>(payload.sampling),
+                           payload.samplingValue,
+                           payload.tagCount,
+                           owned->structNamePointers.data(),
+                           static_cast<uint8_t>(owned->structNamePointers.size())};
+        sites[payload.id] = std::move(owned);
         return;
     }
     case file::FrameType::ThreadDef: {
-        if (size < 4) return;
-        const auto index = read<std::uint32_t>(cursor);
-        threads[index] = std::string(cursor, end);
+        if (size < sizeof(file::ThreadDefPayload)) return;
+        const auto payload = readAt<file::ThreadDefPayload>(cursor);
+        std::string name(cursor, end);
+        std::string body = "\"lv\":\"info\",\"event\":\"thread\",\"th\":";
+        detail::appendJsonString(body, name);
+        body.append(",\"tid\":");
+        detail::appendUnsigned(body, payload.osThreadId);
+        if (knownThreadLines.insert(body).second) {
+            pendingThreadLines.push_back(std::move(body));  // 次の Block の始めの位置に出す
+        }
+        threads[payload.index] = std::move(name);
         return;
     }
     case file::FrameType::Block: {
-        if (size < 16) return;
-        const auto thread = read<std::uint32_t>(cursor);
-        cursor += 4;
-        const auto drainTick = read<std::uint64_t>(cursor);
+        if (size < sizeof(file::BlockPayload)) return;
+        const auto block = readAt<file::BlockPayload>(cursor);
+        bool firstRecord = true;
         while (end - cursor >= static_cast<std::ptrdiff_t>(sizeof(RecordHeader))) {
             RecordHeader header;
             std::memcpy(&header, cursor, sizeof(header));
-            if (header.size < sizeof(RecordHeader) || header.size > static_cast<std::size_t>(end - cursor)) {
+            if (header.size < sizeof(RecordHeader) || header.size > static_cast<size_t>(end - cursor)) {
                 break;  // 壊れている
             }
-            // 8 バイトにそろえて写してから読む（ファイルの中の位置はそろっていない）。
-            std::vector<std::uint64_t> record((header.size + 7) / 8);
-            std::memcpy(record.data(), cursor, header.size);
-            const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(record.data()));
-            const std::uint64_t order = view.tick != 0 ? view.tick : drainTick;
-            if (header.kind == RecordKind::Frame) {
-                Entry entry{order, view.tick, EntryKind::Frame, thread, nullptr, {}, {}};
-                std::memcpy(&entry.frame, view.payload, 8);
-                entries.push_back(std::move(entry));
-            } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
-                auto found = sites.find(header.site);
-                if (found != sites.end() && found->second->site.level >= filter.level &&
-                    recordSelected(filter, found->second->type, header.kind == RecordKind::Batch)) {
-                    entries.push_back(Entry{order, view.tick,
-                                            header.kind == RecordKind::Log ? EntryKind::Record : EntryKind::Batch,
-                                            thread, found->second.get(), std::move(record), {}});
+            if (header.kind != RecordKind::Padding) {
+                std::vector<uint64_t> record((header.size + 7) / 8);
+                std::memcpy(record.data(), cursor, header.size);
+                const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(record.data()));
+                const uint64_t order = view.tick != 0 ? view.tick : block.drainTick;
+                if (firstRecord) {
+                    firstRecord = false;
+                    for (std::string& body : pendingThreadLines) {
+                        if (level <= Level::Info && typeSelected("event", false)) {
+                            entries.push_back(Entry{order, view.tick, EntryKind::Event, 0, nullptr, {}, std::move(body)});
+                        }
+                    }
+                    pendingThreadLines.clear();
+                }
+                if (header.kind == RecordKind::Frame) {
+                    Entry entry{order, view.tick, EntryKind::Frame, block.thread, nullptr, {}, {}};
+                    std::memcpy(&entry.frame, view.payload, 8);
+                    entries.push_back(std::move(entry));
+                } else if (header.kind == RecordKind::FiberSwitch) {
+                    entries.push_back(Entry{order, view.tick, EntryKind::FiberSwitch, block.thread, nullptr,
+                                            std::move(record), {}});
+                } else if (header.kind == RecordKind::ScopeEnter || header.kind == RecordKind::ScopeExit) {
+                    auto found = sites.find(header.site);  // 積み重ねを組み立てるため、絞り込まずに取っておく
+                    if (found != sites.end()) {
+                        entries.push_back(Entry{order, view.tick,
+                                                header.kind == RecordKind::ScopeEnter ? EntryKind::ScopeEnter
+                                                                                      : EntryKind::ScopeExit,
+                                                block.thread, found->second.get(), std::move(record), {}});
+                    }
+                } else if (header.kind == RecordKind::Log || header.kind == RecordKind::Batch) {
+                    auto found = sites.find(header.site);
+                    const bool batch = header.kind == RecordKind::Batch;
+                    if (found != sites.end() && found->second->site.level >= level &&
+                        typeSelected(found->second->type, batch)) {
+                        entries.push_back(Entry{order, view.tick, batch ? EntryKind::Batch : EntryKind::Record,
+                                                block.thread, found->second.get(), std::move(record), {}});
+                    }
                 }
             }
             cursor += header.size;
@@ -197,31 +313,35 @@ void LogReader::State::frame(file::FrameType type, const char* data, std::size_t
     }
     case file::FrameType::Event: {
         if (size < 8) return;
-        const auto tick = read<std::uint64_t>(cursor);
+        const auto tick = readAt<uint64_t>(cursor);
         std::string body(cursor, end);
-        if (eventLevel(body) < filter.level || !typeSelected(filter, eventType(body))) return;
+        if (eventLevel(body) < level || !typeSelected(eventType(body), false)) return;
         entries.push_back(Entry{tick, tick, EntryKind::Event, 0, nullptr, {}, std::move(body)});
         return;
     }
     }
 }
 
-LogReader::LogReader(ViewFormat format, ViewFilter filter) : state_(std::make_unique<State>(format, std::move(filter))) {}
+LogReader::LogReader(ViewFormat format, const ViewFilter& filter) : state_(new State(format, filter)) {}
 
-LogReader::~LogReader() = default;
+LogReader::~LogReader() {
+    delete state_;
+}
 
 bool LogReader::invalid() const noexcept {
     return state_->invalid;
 }
 
-void LogReader::feed(const void* data, std::size_t size) {
+void LogReader::feed(const void* data, size_t size) {
     State& s = *state_;
     if (s.invalid) return;
     s.pending.append(static_cast<const char*>(data), size);
-    std::size_t offset = 0;
+    size_t offset = 0;
     if (!s.headerRead) {
         if (s.pending.size() < sizeof(file::kMagic) + 4) return;
-        if (std::memcmp(s.pending.data(), file::kMagic, sizeof(file::kMagic)) != 0) {
+        uint32_t version = 0;
+        std::memcpy(&version, s.pending.data() + sizeof(file::kMagic), 4);
+        if (std::memcmp(s.pending.data(), file::kMagic, sizeof(file::kMagic)) != 0 || version != file::kVersion) {
             s.invalid = true;
             return;
         }
@@ -240,17 +360,24 @@ void LogReader::feed(const void* data, std::size_t size) {
     s.pending.erase(0, offset);
 }
 
-void LogReader::take(std::string& out) {
+const char* LogReader::take(size_t& size) {
     State& s = *state_;
+    s.out.clear();
     std::stable_sort(s.entries.begin(), s.entries.end(),
                      [](const Entry& a, const Entry& b) { return a.order < b.order; });
     std::string line;
     for (const Entry& entry : s.entries) {
-        line.clear();
         if (entry.kind == EntryKind::Frame) {
             s.currentFrame = entry.frame;  // ここから後の記録はこのフレーム
             continue;
         }
+        if (entry.kind == EntryKind::FiberSwitch) {
+            const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(entry.record.data()));
+            s.threadFiber[entry.thread] = view.aux;
+            continue;
+        }
+        const bool inFrames = s.currentFrame >= s.firstFrame && s.currentFrame <= s.lastFrame;
+        line.clear();
         if (entry.kind == EntryKind::Event) {
             if (s.format == ViewFormat::Json && entry.body.find("\"event\":\"session.start\"") != std::string::npos) {
                 std::string body = entry.body;
@@ -263,51 +390,114 @@ void LogReader::take(std::string& out) {
         } else {
             auto name = s.threads.find(entry.thread);
             const std::string thread = name != s.threads.end() ? name->second : "T" + std::to_string(entry.thread);
-            if (!s.filter.thread.empty() && thread != s.filter.thread) continue;
             const auto* header = reinterpret_cast<const RecordHeader*>(entry.record.data());
             const RecordView view = viewRecord(*header);
-            if (entry.kind == EntryKind::Record) {
-                s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, entry.site->site, view.payload,
-                                         thread);
+            const uint64_t context = s.contextOf(entry.thread);
+            const uint64_t fiber = (context >> 63) != 0 ? 0 : context;
+            std::vector<OpenScope>& stack = s.openScopes[context];
+            const Site& site = entry.site->site;
+            const bool shown = inFrames && (s.threadNames.empty() || listed(s.threadNames, thread));
+
+            if (entry.kind == EntryKind::ScopeEnter || entry.kind == EntryKind::ScopeExit) {
+                const bool visible = shown && site.level >= s.level && s.typeSelected(entry.site->type, false);
+                if (entry.kind == EntryKind::ScopeEnter) {
+                    OpenScope opened{view.aux, {}, {}, {}, view.tick};
+                    detail::renderMessage(opened.name, &opened.args, site, view.payload);
+                    opened.word = opened.name.substr(0, opened.name.find(' '));
+                    const bool selected = s.inSelectedScope(stack);
+                    s.formatter.setContext(s.scopePath(stack), fiber);
+                    stack.push_back(std::move(opened));
+                    if (!visible || !(selected || s.inSelectedScope(stack))) continue;
+                    const OpenScope& top = stack.back();
+                    s.formatter.appendScope(line, view.tick, s.currentFrame, site, top.name, top.args, thread, true,
+                                            -1.0);
+                } else {
+                    // 出る：トークンで対にする（ファイバーが ID を知らせずに移ったときは、ほかの積み重ねも探す）
+                    std::vector<OpenScope>* owner = &stack;
+                    auto match = [&](std::vector<OpenScope>& candidates) {
+                        for (size_t i = candidates.size(); i-- > 0;) {
+                            if (candidates[i].token == view.aux) return i;
+                        }
+                        return std::string::npos;
+                    };
+                    size_t at = match(stack);
+                    if (at == std::string::npos) {
+                        for (auto& [key, other] : s.openScopes) {
+                            if ((at = match(other)) != std::string::npos) {
+                                owner = &other;
+                                break;
+                            }
+                        }
+                    }
+                    if (at == std::string::npos) continue;  // 入った記録がない（捨てられた・前のファイル）
+                    const OpenScope closed = (*owner)[at];
+                    const bool selected = s.inSelectedScope(*owner);
+                    owner->resize(at);  // 閉じ忘れた内側も一緒に閉じる
+                    if (!visible || !selected) continue;
+                    const double microseconds =
+                        view.tick != 0 && closed.tick != 0 && view.tick >= closed.tick
+                            ? static_cast<double>(view.tick - closed.tick) /
+                                  s.formatter.timeBase().ticksPerNanosecond / 1000.0
+                            : -1.0;
+                    s.formatter.setContext(s.scopePath(*owner), fiber);
+                    s.formatter.appendScope(line, view.tick, s.currentFrame, site, closed.name, closed.args, thread,
+                                            false, microseconds);
+                }
             } else {
-                BatchInfo info;
-                std::memcpy(&info, view.payload, sizeof(info));
-                s.formatter.appendBatch(line, view.tick, s.currentFrame, entry.site->site, info,
-                                        view.payload + sizeof(info), thread, s.filter.batchRows);
+                if (!shown || !s.inSelectedScope(stack)) continue;
+                s.formatter.setContext(s.scopePath(stack), fiber);
+                if (entry.kind == EntryKind::Record) {
+                    s.formatter.appendRecord(line, view.tick, s.currentFrame, view.aux, site, view.payload, thread);
+                } else {
+                    const size_t used =
+                        static_cast<size_t>(view.payload - reinterpret_cast<const unsigned char*>(header));
+                    s.formatter.appendBatch(line, view.tick, s.currentFrame, site, view.payload,
+                                            header->size > used ? header->size - used : 0, thread, s.batchRows);
+                }
             }
         }
-        if (!s.filter.contains.empty() && line.find(s.filter.contains) == std::string::npos) continue;
-        out.append(line);
+        if (!s.contains.empty() && line.find(s.contains) == std::string::npos) continue;
+        s.out.append(line);
     }
     s.entries.clear();
+    size = s.out.size();
+    return s.out.c_str();
 }
 
-std::string readLog(const std::filesystem::path& path, ViewFormat format, const ViewFilter& filter) {
+bool readLog(const char* path, ViewFormat format, const ViewFilter& filter, TextSink sink, void* user) {
+    if (!path || !sink) return false;
+    std::ifstream input(std::filesystem::path(std::u8string(path, path + std::strlen(path))), std::ios::binary);
+    if (!input) return false;
     LogReader reader(format, filter);
-    std::ifstream input(path, std::ios::binary);
-    std::vector<char> buffer(std::size_t{1} << 20);
+    std::vector<char> buffer(size_t{1} << 20);
     while (input) {
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        reader.feed(buffer.data(), static_cast<std::size_t>(input.gcount()));
+        reader.feed(buffer.data(), static_cast<size_t>(input.gcount()));
     }
-    std::string out;
-    reader.take(out);
-    return out;
+    if (reader.invalid()) return false;
+    size_t size = 0;
+    const char* text = reader.take(size);
+    sink(text, size, user);
+    return true;
 }
 
-std::filesystem::path latestLog(const std::filesystem::path& directory) {
-    std::filesystem::path latest;
+const char* latestLog(const char* directory) {
+    static thread_local std::string latest;
+    latest.clear();
+    if (!directory) return nullptr;
     std::filesystem::file_time_type latestTime{};
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+    const std::filesystem::path folder(std::u8string(directory, directory + std::strlen(directory)));
+    for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
         if (entry.path().extension() != ".ecolog") continue;
         const auto time = entry.last_write_time(error);
         if (latest.empty() || time > latestTime) {
-            latest = entry.path();
+            const auto text = entry.path().u8string();
+            latest.assign(reinterpret_cast<const char*>(text.data()), text.size());
             latestTime = time;
         }
     }
-    return latest;
+    return latest.empty() ? nullptr : latest.c_str();
 }
 
-}  // namespace eco::log
+}  // namespace lg

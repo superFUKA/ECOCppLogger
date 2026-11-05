@@ -1,6 +1,6 @@
 #pragma once
 
-// テスト用：テストごとのフォルダーにログを書き、書き出した行を読む。
+// テスト用：テストごとのフォルダーにログを書き、読んだ行を返す。
 
 #include <gtest/gtest.h>
 
@@ -13,72 +13,92 @@
 #include "ECOCppLogger/ECOCppLogger.h"
 #include "ECOCppLogger/Reader.h"
 
-namespace eco::log::test {
+namespace lgtest {
 
-inline std::filesystem::path testDirectory() {
+inline std::string testDirectory() {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
-    return std::filesystem::temp_directory_path() / "ECOCppLoggerTest" /
-           (std::string(info->test_suite_name()) + "." + info->name());
+    const auto path = std::filesystem::temp_directory_path() / "ECOCppLoggerTest" /
+                      (std::string(info->test_suite_name()) + "." + info->name());
+    const auto text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
 }
 
-inline Config testConfig() {
-    Config config;
-    config.directory = testDirectory();
-    config.consoleLevel = Level::Off;
-    config.installCrashHandler = false;
-    config.threadBufferBytes = std::size_t{4} << 20;
-    return config;
+inline std::filesystem::path pathOf(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
 }
 
-// .ecolog を読んで JSON Lines（LLM 向けの形）にし、1行ずつに分ける。
-inline std::vector<std::string> readLines(const std::filesystem::path& path,
-                                          ViewFormat format = ViewFormat::Json) {
+// テストの間、Config の文字列を持っておく。
+struct TestConfig {
+    std::string directory = testDirectory();
+    lg::Config config;
+
+    TestConfig() {
+        config.directory = directory.c_str();
+        config.crash.handler = false;
+        config.threadBufferBytes = uint64_t{4} << 20;
+    }
+};
+
+inline std::string readText(const char* path, lg::ViewFormat format = lg::ViewFormat::Json,
+                            const lg::ViewFilter& filter = {}) {
+    std::string text;
+    EXPECT_TRUE(lg::readLog(
+        path, format, filter,
+        [](const char* data, size_t size, void* user) { static_cast<std::string*>(user)->append(data, size); }, &text))
+        << path;
+    return text;
+}
+
+inline std::vector<std::string> splitLines(const std::string& text) {
     std::vector<std::string> lines;
-    std::istringstream input(readLog(path, format));
+    std::istringstream input(text);
     for (std::string line; std::getline(input, line);) {
         lines.push_back(line);
     }
     return lines;
 }
 
-inline std::size_t countContaining(const std::vector<std::string>& lines, std::string_view text) {
-    return static_cast<std::size_t>(std::count_if(lines.begin(), lines.end(), [&](const std::string& line) {
+inline std::vector<std::string> readLines(const char* path, lg::ViewFormat format = lg::ViewFormat::Json,
+                                          const lg::ViewFilter& filter = {}) {
+    return splitLines(readText(path, format, filter));
+}
+
+inline size_t countContaining(const std::vector<std::string>& lines, std::string_view text) {
+    return static_cast<size_t>(std::count_if(lines.begin(), lines.end(), [&](const std::string& line) {
         return line.find(text) != std::string::npos;
     }));
 }
 
 inline const std::string* findContaining(const std::vector<std::string>& lines, std::string_view text) {
     for (const auto& line : lines) {
-        if (line.find(text) != std::string::npos) {
-            return &line;
-        }
+        if (line.find(text) != std::string::npos) return &line;
     }
     return nullptr;
 }
 
-// start() から stop() まで。lines() は flush() してから今のファイルを読む。
+// start() から stop() まで。lines() は writeOut() してから今のファイルを読む。
 class Session {
 public:
-    explicit Session(Config config = testConfig()) {
+    explicit Session(const lg::Config& config) {
         std::error_code error;
-        std::filesystem::remove_all(config.directory, error);
-        setLevel(config.level);
-        EXPECT_TRUE(start(config));
+        std::filesystem::remove_all(pathOf(config.directory), error);
+        EXPECT_TRUE(lg::start(config));
+        file_ = lg::currentFile();
     }
     ~Session() {
-        stop();
-        setLevel(Level::Trace);
+        lg::stop();
+        lg::setLevel(lg::Level::Trace);
     }
 
-    std::vector<std::string> lines() {
-        flush();
-        return readLines(currentFile());
+    const std::string& file() const { return file_; }
+
+    std::vector<std::string> lines(lg::ViewFormat format = lg::ViewFormat::Json, const lg::ViewFilter& filter = {}) {
+        lg::writeOut();
+        return readLines(file_.c_str(), format, filter);
     }
 
-    std::vector<std::string> linesWithStats() {
-        flushStats();
-        return readLines(currentFile());
-    }
+private:
+    std::string file_;
 };
 
-}  // namespace eco::log::test
+}  // namespace lgtest

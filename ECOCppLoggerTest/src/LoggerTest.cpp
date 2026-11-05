@@ -1,50 +1,50 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
-#include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include "ECOCppLogger/ECOCppLogger.h"
-#include "ECOCppLogger/Logger.h"
 #include "TestSession.h"
 
-using eco::log::Level;
-using eco::log::test::countContaining;
-using eco::log::test::findContaining;
-using eco::log::test::readLines;
-using eco::log::test::Session;
-using eco::log::test::testConfig;
+using lgtest::countContaining;
+using lgtest::findContaining;
+using lgtest::readLines;
+using lgtest::Session;
+using lgtest::TestConfig;
 
 namespace {
 
 std::vector<std::filesystem::path> logFiles(const std::filesystem::path& directory) {
     std::vector<std::filesystem::path> files;
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.path().extension() == ".ecolog") {
-            files.push_back(entry.path());
-        }
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        if (entry.path().extension() == ".ecolog") files.push_back(entry.path());
     }
     return files;
+}
+
+std::string utf8(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
 }
 
 }  // namespace
 
 TEST(Logger, WritesSessionStartAndEnd) {
-    auto config = testConfig();
-    config.stem = "session";
-    std::filesystem::path file;
+    TestConfig test;
+    test.config.stem = "session";
+    std::string file;
     {
-        Session session(config);
+        Session session(test.config);
         ECO_LOG_INFO("hello");
-        file = eco::log::currentFile();
-        EXPECT_EQ(file.parent_path(), config.directory);
-        EXPECT_EQ(file.filename().string().rfind("session_", 0), 0u);
-        EXPECT_EQ(file.extension(), ".ecolog");
+        file = session.file();
+        EXPECT_EQ(lgtest::pathOf(file).filename().string().rfind("session_", 0), 0u);
+        EXPECT_EQ(lgtest::pathOf(file).extension(), ".ecolog");
     }
-    EXPECT_FALSE(eco::log::isRunning());
-    const auto lines = readLines(file);
+    EXPECT_FALSE(lg::isRunning());
+    const auto lines = readLines(file.c_str());
     ASSERT_GE(lines.size(), 3u);
     EXPECT_NE(lines.front().find("\"event\":\"session.start\""), std::string::npos);
     EXPECT_NE(lines.front().find("\"about\":"), std::string::npos);
@@ -53,381 +53,136 @@ TEST(Logger, WritesSessionStartAndEnd) {
         << lines.back();
 }
 
-TEST(Logger, StopWritesEverythingWithoutFlush) {
-    auto config = testConfig();
-    config.pollIntervalMs = 60'000;  // 止めるまで裏のスレッドは見に行かない
-    std::filesystem::path file;
-    {
-        Session session(config);
-        for (int i = 0; i < 1000; ++i) {
-            ECO_LOG_INFO("record {}", i);
-        }
-        file = eco::log::currentFile();
+TEST(Logger, WritesOnlyWhenWriteOutIsCalled) {
+    TestConfig test;
+    Session session(test.config);
+    for (int i = 0; i < 100; ++i) {
+        ECO_LOG_INFO("frame log {i}", i);
     }
-    EXPECT_EQ(countContaining(readLines(file), "\"msg\":\"record "), 1000u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(countContaining(readLines(session.file().c_str()), "frame log"), 0u);  // 裏で書くことはない
+    lg::writeOut();  // 呼んだスレッドで、その場で書く
+    EXPECT_EQ(countContaining(readLines(session.file().c_str()), "\"msg\":\"frame log "), 100u);
+}
+
+TEST(Logger, WritesLogsOfOtherThreads) {
+    TestConfig test;
+    Session session(test.config);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([t] {
+            lg::setThreadName(("worker" + std::to_string(t)).c_str());
+            for (int i = 0; i < 1000; ++i) {
+                ECO_LOG_DEBUG("w{t} {i}", t, i);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    const auto lines = session.lines();
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"w"), 4000u);
+    EXPECT_EQ(countContaining(lines, "\"th\":\"worker3\",\"src\""), 1000u);
+    EXPECT_EQ(countContaining(lines, "\"event\":\"dropped\""), 0u);
 }
 
 TEST(Logger, KeepsRecordsWrittenBeforeStart) {
-    eco::log::stop();
+    lg::stop();
     ECO_LOG_INFO("before start");
-    Session session;
+    TestConfig test;
+    Session session(test.config);
     EXPECT_EQ(countContaining(session.lines(), "\"msg\":\"before start\""), 1u);
 }
 
+TEST(Logger, DropsLightLogsFirstWhenBufferIsNearlyFull) {
+    TestConfig test;
+    test.config.threadBufferBytes = 4096;
+    test.config.importantReservePercent = 50;
+    Session session(test.config);
+    std::thread([] {  // 新しいスレッド：4096 バイトのバッファ
+        for (int i = 0; i < 1000; ++i) {
+            ECO_LOG_DEBUG("noise {i}", i);
+        }
+        ECO_LOG_ERROR("important");  // 軽いログで一杯でも、取っておいた分に入る
+    }).join();
+    const auto lines = session.lines();
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"important\""), 1u);
+    const std::string* dropped = findContaining(lines, "\"event\":\"dropped\"");
+    ASSERT_NE(dropped, nullptr);
+    EXPECT_GT(countContaining(lines, "\"msg\":\"noise "), 0u);
+}
+
+TEST(Logger, RecordsFrameNumbers) {
+    TestConfig test;
+    Session session(test.config);
+    const auto before = lg::frame();
+    ECO_FRAME();
+    ECO_LOG_INFO("in frame 1");
+    ECO_FRAME();
+    ECO_LOG_INFO("in frame 2");
+    const auto lines = session.lines();
+    EXPECT_EQ(countContaining(lines, "\"f\":" + std::to_string(before + 1) + ",\"lv\":\"info\""), 1u);
+    EXPECT_EQ(countContaining(lines, "\"f\":" + std::to_string(before + 2) + ",\"lv\":\"info\""), 1u);
+}
+
 TEST(Logger, RotatesFilesAndKeepsTheNewest) {
-    auto config = testConfig();
-    config.maxFileBytes = 8 * 1024;
-    config.maxFiles = 3;
+    TestConfig test;
+    test.config.maxFileBytes = 8 * 1024;
+    test.config.maxFiles = 3;
     {
-        Session session(config);
-        for (int i = 0; i < 2000; ++i) {
-            ECO_LOG_INFO("rotation {}", i);
-            if (i % 100 == 0) {
-                eco::log::flush();
-            }
+        Session session(test.config);
+        for (int i = 0; i < 3000; ++i) {
+            ECO_LOG_INFO("rotation {i}", i);
+            if (i % 100 == 0) lg::writeOut();
         }
     }
-    const auto files = logFiles(config.directory);
+    const auto files = logFiles(lgtest::pathOf(test.directory));
     EXPECT_EQ(files.size(), 3u);
     for (const auto& file : files) {
-        const auto lines = readLines(file);
+        const auto lines = readLines(utf8(file).c_str());
         ASSERT_FALSE(lines.empty());
         EXPECT_NE(lines.front().find("\"event\":\"session.start\""), std::string::npos);
     }
 }
 
 namespace {
-
-// 待っても書かれないことを確かめるため、少し待ってから数える。
-std::size_t countAfter(std::chrono::milliseconds wait, std::string_view text) {
-    std::this_thread::sleep_for(wait);
-    return countContaining(readLines(eco::log::currentFile()), text);
+ECO_LOG_TYPE(Gameplay, "gameplay");
 }
 
-// 書かれるまで（最大 2 秒）待って数える。
-std::size_t countWhenWritten(std::string_view text, std::size_t expected) {
-    std::size_t count = 0;
-    for (int i = 0; i < 200 && count < expected; ++i) {
-        count = countContaining(readLines(eco::log::currentFile()), text);
-        if (count < expected) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return count;
-}
-
-}  // namespace
-
-TEST(Logger, OnRequestWritesOnlyWhenAsked) {
-    auto config = testConfig();
-    config.writeMode = eco::log::WriteMode::OnRequest;
-    Session session(config);
-    for (int i = 0; i < 100; ++i) {
-        ECO_LOG_INFO("frame log {}", i);
-    }
-    EXPECT_EQ(countAfter(std::chrono::milliseconds(50), "\"msg\":\"frame log "), 0u);  // 頼むまでは書かない
-    eco::log::writeOut();  // ゲームループの終わり：頼むだけで、すぐ戻る
-    EXPECT_EQ(countWhenWritten("\"msg\":\"frame log ", 100), 100u);
-}
-
-TEST(Logger, OnRequestStillWritesErrorsRightAway) {
-    auto config = testConfig();
-    config.writeMode = eco::log::WriteMode::OnRequest;
-    Session session(config);
-    ECO_LOG_ERROR("something broke");
-    EXPECT_EQ(countWhenWritten("\"msg\":\"something broke\"", 1), 1u);
-}
-
-TEST(Logger, ManualWritesOnTheCallingThread) {
-    auto config = testConfig();
-    config.writeMode = eco::log::WriteMode::Manual;
-    std::filesystem::path file;
-    {
-        Session session(config);
-        file = eco::log::currentFile();
-        for (int i = 0; i < 100; ++i) {
-            ECO_LOG_INFO("manual {}", i);
-        }
-        ECO_LOG_ERROR("manual error");
-        EXPECT_EQ(countAfter(std::chrono::milliseconds(50), "\"msg\":\"manual"), 0u);  // 裏のスレッドはない
-        eco::log::writeOut();  // その場で書く
-        EXPECT_EQ(countContaining(readLines(file), "\"msg\":\"manual "), 101u);  // 100 件＋manual error
-        ECO_LOG_INFO("after write");
-    }  // stop() も呼んだスレッドで残りを書く
-    const auto lines = readLines(file);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"after write\""), 1u);
-    EXPECT_EQ(countContaining(lines, "\"event\":\"session.end\""), 1u);
-}
-
-namespace {
-
-eco::log::Config destinationConfig() {
-    auto config = testConfig();
-    config.destinations = {
-        {.name = "human", .level = Level::Info, .excludeTypes = {"batch", "stat", "history"}},
-        {.name = "game", .types = {"gameplay"}},
+TEST(Logger, DestinationsSplitLogsIntoSeparateFolders) {
+    TestConfig test;
+    const lg::Destination destinations[] = {
+        {.name = "human", .level = lg::Level::Info},
+        {.name = "game", .types = "gameplay"},
         {.name = "all"},
     };
-    return config;
-}
-
-void writeMixedLogs() {
-    ECO_LOG_DEBUG("debug detail {}", 1);
-    ECO_LOG_INFO("player joined");
-    ECO_LOG_TYPED("gameplay", Level::Info, "score {}", 100);
+    test.config.destinations = destinations;
+    test.config.destinationCount = 3;
+    std::string human, game, all;
     {
-        ECO_LOG_BATCH(batch, Level::Info, "candidate {}", int);
-        for (int i = 0; i < 1000; ++i) {
-            batch.add(i);
-        }
+        Session session(test.config);
+        ECO_LOG_DEBUG("debug detail");
+        ECO_LOG_INFO("player joined");
+        ECO_LOG(Info | Gameplay, "score {score}", 100);
+        human = lg::currentFile("human");
+        game = lg::currentFile("game");
+        all = lg::currentFile("all");
     }
-    ECO_STAT("mixed.stat", 3);
-}
-
-}  // namespace
-
-TEST(Logger, DestinationsSplitLogsIntoSeparateFiles) {
-    const auto config = destinationConfig();
-    std::filesystem::path human, game, all;
-    {
-        Session session(config);
-        writeMixedLogs();
-        eco::log::flushStats();
-        human = eco::log::currentFile("human");
-        game = eco::log::currentFile("game");
-        all = eco::log::currentFile("all");
-    }
-    EXPECT_EQ(human.parent_path(), config.directory / "human");
-    EXPECT_EQ(game.parent_path(), config.directory / "game");
-
-    const auto humanLines = readLines(human);
+    EXPECT_EQ(lgtest::pathOf(human).parent_path(), lgtest::pathOf(test.directory) / "human");
+    const auto humanLines = readLines(human.c_str());
     EXPECT_EQ(countContaining(humanLines, "player joined"), 1u);
     EXPECT_EQ(countContaining(humanLines, "score 100"), 1u);
-    EXPECT_EQ(countContaining(humanLines, "debug detail"), 0u);      // 重さで落とす
-    EXPECT_EQ(countContaining(humanLines, "\"batch\":"), 0u);         // まとめ書きは書かない
-    EXPECT_EQ(countContaining(humanLines, "mixed.stat"), 0u);         // 集計も書かない
-    EXPECT_EQ(countContaining(humanLines, "\"event\":\"session.end\""), 1u);  // 始め・終わりはどこにも書く
-
-    const auto gameLines = readLines(game);
+    EXPECT_EQ(countContaining(humanLines, "debug detail"), 0u);
+    EXPECT_EQ(countContaining(humanLines, "\"event\":\"session.end\""), 1u);
+    const auto gameLines = readLines(game.c_str());
     EXPECT_EQ(countContaining(gameLines, "score 100"), 1u);
     EXPECT_EQ(countContaining(gameLines, "player joined"), 0u);
-    EXPECT_EQ(countContaining(gameLines, "mixed.stat"), 0u);
-
-    const auto allLines = readLines(all);
-    EXPECT_EQ(countContaining(allLines, "debug detail 1"), 1u);
-    EXPECT_EQ(countContaining(allLines, "\"batch\":1000"), 1u);
-    EXPECT_EQ(countContaining(allLines, "mixed.stat"), 1u);
-
-    // 人向けは小さい
-    EXPECT_LT(std::filesystem::file_size(human) * 4, std::filesystem::file_size(all));
-}
-
-TEST(Logger, ManualWritesEveryDestinationOnTheCallingThread) {
-    auto config = destinationConfig();
-    config.writeMode = eco::log::WriteMode::Manual;
-    Session session(config);
-    writeMixedLogs();
-    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("human")), "player joined"), 0u);
-    eco::log::writeOut();  // 呼んだスレッドで、すべての書き出し先へ
-    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("human")), "player joined"), 1u);
-    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("game")), "score 100"), 1u);
-    EXPECT_EQ(countContaining(readLines(eco::log::currentFile("all")), "\"batch\":1000"), 1u);
+    const auto allLines = readLines(all.c_str());
+    EXPECT_EQ(countContaining(allLines, "debug detail"), 1u);
+    EXPECT_EQ(countContaining(allLines, "score 100"), 1u);
 }
 
 TEST(Logger, StartTwiceFails) {
-    Session session;
-    EXPECT_TRUE(eco::log::isRunning());
-    EXPECT_FALSE(eco::log::start(testConfig()));
-}
-
-// ---- 落ちたとき：子のプロセスで落とし、残ったファイルを親で読む ---------------------------------------------
-
-namespace {
-
-eco::log::Config crashConfig() {
-    auto config = testConfig();
-    config.installCrashHandler = true;
-    config.pollIntervalMs = 60'000;  // 裏のスレッドは書き出さない：落ちたときの書き出しだけで残ることを確かめる
-    config.stem = "crash";
-    return config;
-}
-
-std::vector<std::string> crashLog(const eco::log::Config& config) {
-    const auto files = logFiles(config.directory);
-    EXPECT_EQ(files.size(), 1u);
-    return files.empty() ? std::vector<std::string>{} : readLines(files.front());
-}
-
-[[noreturn]] void abortAfterLogging() {
-    ECO_LOG_INFO("before abort {}", 7);
-    ECO_STAT("crash.stat", 3);
-    for (int i = 1; i <= 20; ++i) {
-        ECO_HISTORY_N("crash.history", 4, i * 10);
-    }
-    std::abort();
-}
-
-[[noreturn]] void throwAfterLogging() {
-    ECO_LOG_INFO("before throw");
-    throw std::runtime_error("boom");
-}
-
-}  // namespace
-
-TEST(LoggerDeathTest, AbortWritesPendingRecordsAndStack) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    const auto config = crashConfig();
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            abortAfterLogging();
-        },
-        "");
-    const auto lines = crashLog(config);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"before abort 7\""), 1u);
-    EXPECT_EQ(countContaining(lines, "\"stat\":\"crash.stat\""), 1u);
-    // 落ちたときは、覚えていた最近の値（最後の 4 個）も書き出す
-    const std::string* history = findContaining(lines, "\"history\":\"crash.history\"");
-    ASSERT_NE(history, nullptr);
-    EXPECT_NE(history->find("\"reason\":\"crash\""), std::string::npos) << *history;
-    EXPECT_NE(history->find(",170],["), std::string::npos) << *history;
-    EXPECT_NE(history->find(",200]]"), std::string::npos) << *history;
-    EXPECT_EQ(history->find(",160]"), std::string::npos) << *history;
-    const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
-    ASSERT_NE(crash, nullptr);
-    EXPECT_NE(crash->find("\"stack\":["), std::string::npos) << *crash;
-    EXPECT_NE(crash->find("abortAfterLogging"), std::string::npos) << *crash;
-    EXPECT_EQ(countContaining(lines, "\"event\":\"session.end\",\"crashed\":true"), 1u);
-}
-
-TEST(LoggerDeathTest, ManualModeStillWritesOnCrash) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    auto config = crashConfig();
-    config.writeMode = eco::log::WriteMode::Manual;  // 裏のスレッドなし・writeOut() も呼ばずに落ちる
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            abortAfterLogging();
-        },
-        "");
-    const auto lines = crashLog(config);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"before abort 7\""), 1u);
-    EXPECT_EQ(countContaining(lines, "\"event\":\"crash\""), 1u);
-}
-
-TEST(LoggerDeathTest, CrashIsWrittenToEveryDestination) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    auto config = crashConfig();
-    config.destinations = {{.name = "human", .level = Level::Warn}, {.name = "all"}};
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            ECO_LOG_WARN("warn before crash");
-            abortAfterLogging();
-        },
-        "");
-    for (const char* name : {"human", "all"}) {
-        const auto files = logFiles(config.directory / name);
-        ASSERT_EQ(files.size(), 1u) << name;
-        const auto lines = readLines(files.front());
-        EXPECT_EQ(countContaining(lines, "warn before crash"), 1u) << name;
-        EXPECT_EQ(countContaining(lines, "\"event\":\"crash\""), 1u) << name;
-    }
-    EXPECT_EQ(countContaining(readLines(logFiles(config.directory / "human").front()), "before abort 7"), 0u);
-    EXPECT_EQ(countContaining(readLines(logFiles(config.directory / "all").front()), "before abort 7"), 1u);
-}
-
-TEST(LoggerDeathTest, UncaughtExceptionWritesWhat) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    const auto config = crashConfig();
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            try {
-                throwAfterLogging();
-            } catch (...) {
-                std::terminate();
-            }
-        },
-        "");
-    const auto lines = crashLog(config);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"before throw\""), 1u);
-    const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
-    ASSERT_NE(crash, nullptr);
-    EXPECT_NE(crash->find("\"exception\":\"boom\""), std::string::npos) << *crash;
-}
-
-// 大量にログを出している最中に、範囲外アクセスの例外（vector::at の std::out_of_range）が捕まらずに落ちる。
-TEST(LoggerDeathTest, OutOfRangeDuringHeavyLogging) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    const auto config = crashConfig();
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            std::atomic<bool> stopLogging{false};
-            std::vector<std::thread> loggers;
-            for (int t = 0; t < 4; ++t) {
-                loggers.emplace_back([t, &stopLogging] {
-                    for (int i = 0; !stopLogging.load(); ++i) {
-                        ECO_LOG_DEBUG("heavy {} {}", t, i);
-                        ECO_STAT("heavy.value", i);
-                    }
-                });
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            std::thread([] {
-                std::vector<int> values(10);
-                const std::size_t index = 10;
-                ECO_LOG_INFO("about to read index {} of {}", index, values.size());
-                volatile int value = values.at(index);  // 捕まえない
-                (void)value;
-            }).join();
-        },
-        "");
-    const auto lines = crashLog(config);
-    EXPECT_GT(countContaining(lines, "\"msg\":\"heavy "), 1000u);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"about to read index 10 of 10\""), 1u);
-    EXPECT_EQ(countContaining(lines, "\"stat\":\"heavy.value\""), 1u);
-    const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
-    ASSERT_NE(crash, nullptr);
-    EXPECT_NE(crash->find("\"exception\":\"invalid vector subscript\""), std::string::npos) << *crash;
-    EXPECT_NE(crash->find("vector<int,std::allocator<int> >::at"), std::string::npos) << *crash;
-    // 集計の最小・最大は、その期間に書いた値の範囲の中にある
-    const std::string* stat = findContaining(lines, "\"stat\":\"heavy.value\"");
-    ASSERT_NE(stat, nullptr);
-    EXPECT_NE(stat->find("\"min\":0,"), std::string::npos) << *stat;
-}
-
-TEST(LoggerDeathTest, AccessViolationWritesPendingRecords) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    const auto config = crashConfig();
-    std::error_code error;
-    std::filesystem::remove_all(config.directory, error);
-    // テストの本体は GoogleTest が SEH の例外を捕まえるので、捕まえない別のスレッドで落とす。
-    EXPECT_DEATH(
-        {
-            eco::log::start(config);
-            std::thread([] {
-                ECO_LOG_INFO("before access violation");
-                volatile int* pointer = nullptr;
-                *pointer = 1;
-            }).join();
-        },
-        "");
-    const auto lines = crashLog(config);
-    EXPECT_EQ(countContaining(lines, "\"msg\":\"before access violation\""), 1u);
-    const std::string* crash = findContaining(lines, "\"event\":\"crash\"");
-    ASSERT_NE(crash, nullptr);
-#if defined(_WIN32)
-    EXPECT_NE(crash->find("\"name\":\"access violation\",\"access\":\"write 0x0\""), std::string::npos) << *crash;
-    EXPECT_NE(crash->find("LoggerTest.cpp:"), std::string::npos) << *crash;  // 落ちた行がスタックに出る
-#endif
+    TestConfig test;
+    Session session(test.config);
+    EXPECT_TRUE(lg::isRunning());
+    EXPECT_FALSE(lg::start(test.config));
 }

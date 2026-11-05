@@ -1,19 +1,22 @@
 #pragma once
 
-// 使う側の関数と、マクロから呼ぶホットパス。
-// ホットパス：重さの確認（relaxed の load 1回）→ TSC を読む → 自分のスレッドのリングバッファに引数をコピー → 書いた位置を公開。
-// 整形・ファイルへの書き出しは裏のスレッドが行う。バッファが一杯なら待たずに捨て、捨てた数を記録に残す。
+// 使う側の関数（名前空間 lg のふつうの関数。中の状態は1つだけ持つ）と、マクロから呼ぶログを書く側の道。
+//
+// ログを書く側：重さの確認 →（時刻を読む）→ 自分のスレッドのバッファに 頭8B＋引数 をコピー → 書いた位置を公開。
+// 文字列は作らない。バッファが一杯なら待たずに捨てて数える。
+// ファイルへの書き出しは lg::writeOut() を呼んだスレッドが行う（裏のスレッドはない）。
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <string.h>
 
 #include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <string>
-#include <vector>
 #include <string_view>
 #include <type_traits>
 
 #include "ECOCppLogger/Clock.h"
+#include "ECOCppLogger/Config.h"
 #include "ECOCppLogger/Level.h"
 #include "ECOCppLogger/Record.h"
 #include "ECOCppLogger/ThreadBuffer.h"
@@ -23,112 +26,65 @@
 #define ECO_LOG_RECORD_TIME 1
 #endif
 
-namespace eco::log {
+namespace lg {
 
-// ファイルへ書き出すタイミング。どれでも、ログを書く側は自分のバッファにコピーするだけで、待たない。
-enum class WriteMode {
-    Interval,   // 裏のスレッドが pollIntervalMs ごとに書き出す（既定）
-    OnRequest,  // 裏のスレッドが、writeOut() を呼ばれたときだけ書き出す（例：ゲームループの終わり。重さ Error 以上のログは
-                // 頼まれなくても書き出す）。書き出しの作業は別のコアで行う
-    Manual,     // 裏のスレッドを作らない。writeOut() を呼んだスレッドがその場で書き出す（呼んだスレッドの時間を使う）
-};
-
-// 書き出し先：ログを分けて別のファイル（フォルダー）に集める。例：人が読む少ないログ・ゲームのログ・全部のログ。
-// ログを書く側は今までと同じ（1回コピーするだけ）。分けるのは書き出すときで、呼び出し位置ごとに1回だけ判定し、
-// 合う記録を文字列にせずに写す。絞り込みの書き方は ECOCppLoggerView と同じ。
-struct Destination {
-    std::string name;             // directory の下のフォルダー名（空なら directory そのもの）
-    Level level = Level::Trace;   // これより軽いログは書かない
-    // 型で絞る。types が空でなければその型だけ、excludeTypes の型は書かない。
-    // 型を付けないログは "log"、まとめ書きは自分の型に加えて "batch"、集計は "stat"、最近の値は "history"。
-    // 始め・終わり・落ちた・捨てた は、どの書き出し先にも書く。
-    std::vector<std::string> types;
-    std::vector<std::string> excludeTypes;
-};
-
-struct Config {
-    // 書き出す先。ファイル名は <stem>_<YYYYMMDD-HHMMSS>_<pid>.ecolog（stem が空なら実行ファイルの名前）。
-    // 中身は2進（動いている間は文字列にしない）。見るときは ECOCppLoggerView か eco::log::readLog で文章・JSON にする。
-    std::filesystem::path directory = "logs";
-    std::string stem;
-
-    // 書き出し先（空なら1つ：絞り込みなしで directory へ）。
-    //   config.destinations = {{.name = "human", .level = Level::Info, .excludeTypes = {"batch", "stat"}},
-    //                          {.name = "all"}};
-    std::vector<Destination> destinations;
-
-    Level level = Level::Trace;       // これより軽いログは記録しない（実行中に setLevel で変えられる）
-    Level consoleLevel = Level::Off;  // これ以上の重さは標準エラーにも文章で出す（そのぶん裏のスレッドが文字列を作る）
-
-    // ログ1件ごとに時刻を残すか。false にすると TSC を読まない（1件あたり数ns・8バイト軽くなる）が、
-    // 表示はスレッドの中の順番だけになり、スレッドをまたいだ前後は裏のスレッドが書き写した順（約2ms単位）になる。
-    bool recordTime = true;
-    // ログ1件ごとに今のフレーム番号（ECO_FRAME）を残すか。
-    bool recordFrame = true;
-
-    std::size_t threadBufferBytes = std::size_t{1} << 20;  // スレッドごとのリングバッファ（2のべき乗に切り上げ）
-    // 書き出すタイミング。OnRequest・Manual では、writeOut() の間にたまるログがバッファ（threadBufferBytes）に
-    // 収まるようにする（溢れた分は捨てて数える）。集計は writeOut() のときに間隔（statIntervalMs）が来ていれば出す。
-    WriteMode writeMode = WriteMode::Interval;
-    std::uint32_t pollIntervalMs = 2;                      // Interval で、裏のスレッドが記録を見に行く間隔
-    std::uint32_t statIntervalMs = 1000;                   // 集計を書き出す間隔
-
-    std::uint64_t maxFileBytes = std::uint64_t{256} << 20;  // 超えたら次のファイル（_part2 …）へ
-    std::uint32_t maxFiles = 8;                              // この実行で残すファイルの数（古いものから消す）
-
-    bool installCrashHandler = true;  // 落ちたときに、残っている記録・集計・スタックを書き出す
-    bool fullPath = false;            // src にソースのフルパスを出す（false ならファイル名だけ）
-};
-
-// 裏のスレッドを起こし、ファイルを開く。start() の前のログはバッファに溜まり、start() の後に書き出される。
+// 始める。ファイルを開き、落ちたときの書き出しを入れる。start() の前のログはバッファに溜まり、次の writeOut() で書く。
 bool start(const Config& config = {});
 
-// 残りをすべて書き出して止める（atexit からも呼ばれる）。
+// 残りを全部書いて閉じる（終了時にも自動で呼ばれる）。
 void stop();
 
-// ここまでに記録したログをすべてファイルへ書き出すまで待つ。
-void flush();
-
-// 集計を今すぐ書き出す（間隔を待たずに）。flush() も行う。
-void flushStats();
-
-// 書き出しを頼む（WriteMode::OnRequest・Manual 向け。ゲームならループの終わりに1回）。
-//   OnRequest：裏のスレッドを起こすだけで、すぐ戻る（書き終わるのを待つなら flush()）
-//   Manual   ：呼んだスレッドで、その場で書き出す
-//   Interval ：裏のスレッドを今すぐ起こす（待たない）
+// 書き出す：すべてのスレッドのバッファにたまったログを、呼んだスレッドでファイルへ書く（ゲームならループの終わりに1回）。
+// 集計は statIntervalMs が来ていれば出す。何本のスレッドから呼んでもよい（中で1つずつ）。
 void writeOut();
 
 bool isRunning() noexcept;
-// 今書いているファイル（destination を指定すればその書き出し先の。空なら最初の書き出し先）。
-std::filesystem::path currentFile(std::string_view destination = {});
+
+// 今書いているファイル（UTF-8。destination を指定すればその書き出し先の）。次の start()・stop() まで有効。
+const char* currentFile(const char* destination = nullptr);
 
 void setLevel(Level level) noexcept;
 Level level() noexcept;
 
-// 呼んだスレッドの名前（出力の "th"）。
-void setThreadName(std::string_view name);
+// 呼んだスレッドの名前（出力の th）。
+void setThreadName(const char* name);
 
-// ECO_HISTORY で覚えている最近の値を、すべてのスレッドの分ファイルへ書き出す（"lv":"history" の行）。
-// 呼んだ時刻より後の値は含めない。落ちたときは自動で書き出す。
-void dumpHistory(std::string_view reason);
-
-// フレームの区切り。記録に今のフレーム番号（"f"）が付く。
+// フレームの区切り（= ECO_FRAME()）。ここから後の記録に、読む側がフレーム番号を付ける。
 void nextFrame() noexcept;
-std::uint64_t frame() noexcept;
+uint64_t frame() noexcept;
+
+// ECO_STAT_HISTORY で覚えている最近の値を、すべてのスレッドの分 書き出す（"lv":"history" の行。次の writeOut() で書く）。
+// 値は呼んだときに写し取る（その後に上書きされても残る）。落ちたときは自動で書き出す。
+void dumpHistory(const char* reason);
+
+// 情報を足す（例：lg::setInfo("level", "forest_02")）。今のファイルと、この後に開くファイルの頭に書く（"event":"info"）。
+// 同じ key をもう一度渡すと置き換える。start() の前に呼んでもよい。
+void setInfo(const char* key, const char* value);
+
+// この実行の ID（UUID の形。start() ごとに新しくなる。ファイルの session.start の run と同じ）。
+const char* runId() noexcept;
+
+// 呼んだスレッドのスタック（関数名・ソースの位置）を書き出す（"event":"stack" の行。次の writeOut() で書く）。
+void writeStack(const char* reason);
+
+// このスレッドで今からファイバー fiberId を走らせる（ファイバーの仕組みが、切り替えるたびに呼ぶ。0 はファイバーなし）。
+// 読む側は、ファイバーごとにスコープの積み重ねを組み立てる（スレッドを移っても続く）。
+void onFiberSwitch(uint64_t fiberId) noexcept;
 
 namespace detail {
 
-extern std::atomic<std::uint8_t> g_level;
-extern std::atomic<std::uint64_t> g_frame;
-extern std::atomic<std::uint64_t> g_statEpoch;
+extern std::atomic<uint8_t> g_level;
+extern std::atomic<uint64_t> g_frame;
 extern std::atomic<bool> g_recordTime;
 extern std::atomic<bool> g_recordFrame;
+extern std::atomic<uint64_t> g_statEpoch;  // 集計の期間（書き出すたびに進む）
 
-// 重さが Error 以上の記録を書いたら、裏のスレッドをすぐ起こす（落ちる前に書き出せるように）。
-void wakeBackend() noexcept;
+uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept;
+uint32_t registerStat(StatSite& site) noexcept;
+HistoryRing* createHistory(StatSlot& slot, const StatSite& site) noexcept;
 
 inline bool isEnabled(Level level) noexcept {
-    return static_cast<std::uint8_t>(level) >= g_level.load(std::memory_order_relaxed);
+    return static_cast<uint8_t>(level) >= g_level.load(std::memory_order_relaxed);
 }
 
 inline bool recordTime() noexcept {
@@ -139,46 +95,49 @@ inline bool recordTime() noexcept {
 #endif
 }
 
-inline std::uint32_t siteId(const Site& site, SiteIdSlot& slot) noexcept {
-    std::uint32_t id = slot.load(std::memory_order_relaxed);
+inline uint32_t siteId(const Site& site, SiteIdSlot& slot) noexcept {
+    uint32_t id = slot.load(std::memory_order_relaxed);
     if (id == 0) [[unlikely]] {
-        id = Registry::instance().registerSite(site, slot);
+        id = registerSite(site, slot);
     }
     return id;
 }
 
-// 1件：頭（8）［＋時刻（8）］［＋間引きの情報（8）］＋引数。
+// 1件：頭（8）［＋時刻（8）］［＋間引き・トークン（8）］＋引数。書けなければ false（捨てて数えた）。
 template <bool HasAux, class... Normalized>
-inline void emitNormalized(const Site& site, SiteIdSlot& slot, std::uint64_t aux, const Normalized&... values) noexcept {
+inline bool emitRecord(RecordKind kind, const Site& site, SiteIdSlot& slot, uint64_t aux,
+                       const Normalized&... values) noexcept {
     ThreadBuffer* buffer = threadBuffer();
-    const std::uint32_t id = siteId(site, slot);
+    const uint32_t id = siteId(site, slot);
     const bool withTime = recordTime();
-    const std::size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + (HasAux ? 8 : 0) +
-                                         (std::size_t{0} + ... + encodedSize(values)));
-    std::byte* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size) : nullptr;
+    const size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + (HasAux ? 8 : 0) +
+                                    (size_t{0} + ... + encodedSize(values)));
+    unsigned char* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size, site.level >= Level::Warn) : nullptr;
     if (!out) [[unlikely]] {
         buffer->countDrop();
-        return;
+        return false;
     }
-    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Log,
-                              static_cast<std::uint8_t>((withTime ? kRecordHasTick : 0) | (HasAux ? kRecordHasAux : 0)),
-                              id};
-    std::memcpy(out, &header, sizeof(header));
-    std::byte* cursor = out + sizeof(RecordHeader);
+    const RecordHeader header{static_cast<uint16_t>(size), kind,
+                              static_cast<uint8_t>((withTime ? kRecordHasTick : 0) | (HasAux ? kRecordHasAux : 0)), id};
+    memcpy(out, &header, sizeof(header));
+    unsigned char* cursor = out + sizeof(RecordHeader);
     if (withTime) {
-        const std::uint64_t tick = ticks();
-        std::memcpy(cursor, &tick, 8);
+        const uint64_t tick = ticks();
+        memcpy(cursor, &tick, 8);
         cursor += 8;
     }
     if constexpr (HasAux) {
-        std::memcpy(cursor, &aux, 8);
+        memcpy(cursor, &aux, 8);
         cursor += 8;
     }
     ((cursor = encode(cursor, values)), ...);
     buffer->commit();
-    if (site.level >= Level::Error) [[unlikely]] {
-        wakeBackend();
-    }
+    return true;
+}
+
+template <bool HasAux, class... Normalized>
+inline void emitNormalized(const Site& site, SiteIdSlot& slot, uint64_t aux, const Normalized&... values) noexcept {
+    emitRecord<HasAux>(RecordKind::Log, site, slot, aux, values...);
 }
 
 // マクロが作る呼び出し口：Emitter{site, id}(引数...)。引数がなくても () で呼べる。
@@ -196,7 +155,7 @@ struct Emitter {
 struct SampledEmitter {
     const Site& site;
     SiteIdSlot& id;
-    std::uint64_t aux;
+    uint64_t aux;
 
     template <class... Args>
     void operator()(const Args&... args) const noexcept {
@@ -204,101 +163,122 @@ struct SampledEmitter {
     }
 };
 
-// まとめ書きの塊を1件として書く。
-inline void writeBatch(const Site& site, SiteIdSlot& slot, std::uint64_t startTick, std::uint32_t count,
-                       std::uint32_t elementSize, const std::byte* elements) noexcept {
-    ThreadBuffer* buffer = threadBuffer();
-    const std::uint32_t id = siteId(site, slot);
-    const bool withTime = startTick != 0;
-    const std::size_t bytes = static_cast<std::size_t>(count) * elementSize;
-    const std::size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + sizeof(BatchInfo) + bytes);
-    std::byte* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size) : nullptr;
-    if (!out) [[unlikely]] {
-        buffer->countDrop();
-        return;
-    }
-    const RecordHeader header{static_cast<std::uint16_t>(size), RecordKind::Batch,
-                              static_cast<std::uint8_t>(withTime ? kRecordHasTick : 0), id};
-    std::memcpy(out, &header, sizeof(header));
-    std::byte* cursor = out + sizeof(RecordHeader);
-    if (withTime) {
-        std::memcpy(cursor, &startTick, 8);
-        cursor += 8;
-    }
-    const BatchInfo info{count, elementSize, withTime ? ticks() : 0};
-    std::memcpy(cursor, &info, sizeof(info));
-    cursor += sizeof(info);
-    std::memcpy(cursor, elements, bytes);
-    buffer->commit();
-}
+// ---- スコープ ----------------------------------------------------------------------------------------
 
-}  // namespace detail
-
-// まとめ書き（ECO_LOG_BATCH が作る）。同じ書式のログが続く前提で、1件ごとには頭も時刻も付けず、
-// 引数の値だけを手元（スタック）の場所に並べる。一杯になったとき・スコープの終わりに、まとめて1件として書く。
-// 1件の追加は 一杯かの確認＋値のコピー だけ。引数はすべて決まった大きさの型（文字列は不可）。
-template <class... Types>
-class Batch {
-    static_assert(sizeof...(Types) > 0, "ECOCppLogger: ECO_LOG_BATCH には引数の型を1つ以上書いてください");
-    static_assert((!std::is_same_v<detail::Normalized<Types>, std::string_view> && ...),
-                  "ECOCppLogger: ECO_LOG_BATCH の引数に文字列は使えません（数値・bool・char・enum・ポインター）");
-
+// ECO_SCOPE が作る：作るときに「入る」、壊すときに「出る」を書く。対にするトークンはこの物のアドレス
+// （生きている間は重ならない。ファイバーで別のスレッドへ移って出ても、読む側がトークンで対にする）。
+class ScopeGuard {
 public:
-    static constexpr std::size_t kElementSize = (std::size_t{0} + ... + detail::fixedEncodedSize<detail::Normalized<Types>>());
-    static constexpr std::size_t kScratchBytes = 8192;
-    static constexpr std::uint32_t kCapacity = static_cast<std::uint32_t>(
-        kScratchBytes / kElementSize > 0 ? kScratchBytes / kElementSize : 1);
-
-    Batch(const Site& site, SiteIdSlot& id, bool compiled) noexcept
-        : site_(site), id_(id), enabled_(compiled && detail::isEnabled(site.level)) {}
-    ~Batch() { flush(); }
-    Batch(const Batch&) = delete;
-    Batch& operator=(const Batch&) = delete;
-
-    void add(const Types&... values) noexcept {
-        if (!enabled_) {
-            return;
+    ScopeGuard(const Site& site, SiteIdSlot& id, bool compiled) noexcept
+        : site_(site), id_(id), active_(compiled && isEnabled(site.level)) {}
+    ~ScopeGuard() {
+        if (active_) {
+            emitRecord<true>(RecordKind::ScopeExit, site_, id_, token());
         }
-        if (count_ == kCapacity) [[unlikely]] {
-            flush();
-        }
-        if (count_ == 0) {
-            startTick_ = detail::recordTime() ? ticks() : 0;
-        }
-        std::byte* cursor = scratch_ + static_cast<std::size_t>(count_) * kElementSize;
-        ((cursor = detail::encode(cursor, detail::normalize(values))), ...);
-        ++count_;
     }
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
 
-    // 溜めた分を今すぐ書く（スコープの終わりでも書く）。
-    void flush() noexcept {
-        if (count_ == 0) {
-            return;
-        }
-        detail::writeBatch(site_, id_, startTick_, count_, static_cast<std::uint32_t>(kElementSize), scratch_);
-        count_ = 0;
+    bool active() const noexcept { return active_; }
+
+    template <class... Args>
+    void enter(const Args&... args) noexcept {
+        active_ = emitRecord<true>(RecordKind::ScopeEnter, site_, id_, token(), normalize(args)...);
     }
-
-    bool enabled() const noexcept { return enabled_; }
 
 private:
+    uint64_t token() const noexcept { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)); }
+
     const Site& site_;
     SiteIdSlot& id_;
-    bool enabled_;
-    std::uint32_t count_ = 0;
-    std::uint64_t startTick_ = 0;
-    alignas(8) std::byte scratch_[kCapacity * kElementSize];
+    bool active_;
 };
 
-namespace detail {
+// ---- 間引き ---------------------------------------------------------------------------------------------
+
+// EVERY_N：この呼び出し位置を、このスレッドで通った回数（0 から）。数は自分のスレッドのバッファの中に持つ。
+inline uint64_t countPass(const Site& site, SiteIdSlot& slot) noexcept {
+    const uint32_t id = siteId(site, slot);
+    return id != 0 ? threadBuffer()->siteState(id).count++ : 0;
+}
+
+// FIRST_N：最初の n 回（すべてのスレッドで合わせて）。n 回を過ぎた後は読むだけ。
+struct FirstCounter {
+    std::atomic<uint64_t> passes{0};
+
+    // 書くなら 1 から数えた回数、書かないなら 0。
+    uint64_t next(uint64_t n) noexcept {
+        if (passes.load(std::memory_order_relaxed) >= n) {
+            return 0;
+        }
+        const uint64_t pass = passes.fetch_add(1, std::memory_order_relaxed);
+        return pass < n ? pass + 1 : 0;
+    }
+};
+
+// EVERY_MS：ms ミリ秒に1回まで（すべてのスレッドで合わせて）。省いた回数を次に書くときに渡す。
+struct RateLimiter {
+    std::atomic<uint64_t> nextTick{0};
+    std::atomic<uint64_t> skipped{0};
+
+    bool allow(uint64_t milliseconds, uint64_t& skippedBefore) noexcept {
+        const uint64_t now = ticks();
+        uint64_t next = nextTick.load(std::memory_order_relaxed);
+        if (now >= next &&
+            nextTick.compare_exchange_strong(
+                next, now + static_cast<uint64_t>(static_cast<double>(milliseconds) * ticksPerMillisecond()),
+                std::memory_order_relaxed)) {
+            skippedBefore = skipped.exchange(0, std::memory_order_relaxed);
+            return true;
+        }
+        skipped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+};
+
+// ON_CHANGE の値：数値・bool・char・enum・ポインター（8 バイトまで、比べるのはビット）。
+template <class T>
+inline auto changeValue(const T& value) noexcept {
+    const auto normalized = normalize(value);
+    using N = decltype(normalized);
+    static_assert(std::is_trivially_copyable_v<N> && sizeof(N) <= 8 && !std::is_same_v<N, std::string_view>,
+                  "ECOCppLogger: ECO_LOG_ON_CHANGE の値は 数値・bool・char・enum・ポインター だけです");
+    return normalized;
+}
+
+// ON_CHANGE：前の値（呼び出し位置・スレッドごと）と比べる。書くなら true（change は 0＝最初の値、1〜＝何回目の変化）。
+template <class N>
+inline bool observeChange(const Site& site, SiteIdSlot& slot, const N& value, uint64_t& change, N& previous) noexcept {
+    const uint32_t id = siteId(site, slot);
+    if (id == 0) [[unlikely]] {
+        return false;
+    }
+    ThreadBuffer::SiteState& state = threadBuffer()->siteState(id);
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(N));
+    if (state.count == 0) {
+        state.count = 1;
+        state.value = bits;
+        change = 0;
+        return true;
+    }
+    if (state.value == bits) {
+        return false;
+    }
+    memcpy(&previous, &state.value, sizeof(N));
+    state.value = bits;
+    change = state.count++;
+    return true;
+}
+
+// ---- 集計 ---------------------------------------------------------------------------------------------
 
 inline StatSlot* statSlotFor(StatSite& site) noexcept {
-    ThreadBuffer* buffer = threadBuffer();
-    std::uint32_t index = site.index.load(std::memory_order_relaxed);
+    uint32_t index = site.index.load(std::memory_order_relaxed);
     if (index == 0) [[unlikely]] {
-        index = Registry::instance().registerStat(site);
+        index = registerStat(site);
     }
-    StatSlot* slot = buffer->statSlot(index);
+    StatSlot* slot = threadBuffer()->statSlot(index);
     if (slot && !slot->site.load(std::memory_order_relaxed)) [[unlikely]] {
         slot->site.store(&site, std::memory_order_release);
     }
@@ -311,9 +291,7 @@ inline void addStat(StatSite& site, double value) noexcept {
     }
 }
 
-HistoryRing* createHistory(StatSlot& slot, const StatSite& site);
-
-// 集計に足し、最近の値として覚えておく（ECO_HISTORY）。
+// 集計に足し、最近の値としても覚える（ECO_STAT_HISTORY）。
 inline void addHistory(StatSite& site, double value) noexcept {
     StatSlot* slot = statSlotFor(site);
     if (!slot) [[unlikely]] {
@@ -323,60 +301,123 @@ inline void addHistory(StatSite& site, double value) noexcept {
     HistoryRing* ring = slot->history.load(std::memory_order_relaxed);
     if (!ring) [[unlikely]] {
         ring = createHistory(*slot, site);
+        if (!ring) return;
     }
     ring->push(value, ticks(), g_frame.load(std::memory_order_relaxed));
 }
 
-// ECO_LOG_ON_CHANGE：呼び出し位置・スレッドごとに、前の値を覚えておく。
-template <class T>
-struct ChangeTracker {
-    bool initialized = false;
-    T previous{};
-    std::uint64_t changes = 0;
-};
-
-template <class T>
-constexpr T changeValue(const T& value) noexcept {
-    static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T> || std::is_pointer_v<T>,
-                  "ECOCppLogger: ECO_LOG_ON_CHANGE に渡せるのは 数値・bool・enum・ポインター です");
-    return value;
-}
-
-// 区間の時間を ticks で集計に足す（ECO_SCOPE_TIME）。
-class ScopeTimer {
+// ECO_STAT_TIME：作ってから壊すまでの時間（TSC の差のまま足す。出すときにマイクロ秒にする）。
+class StatTimer {
 public:
-    explicit ScopeTimer(StatSite& site) noexcept : site_(site), start_(ticks()) {}
-    ~ScopeTimer() { addStat(site_, static_cast<double>(ticks() - start_)); }
-    ScopeTimer(const ScopeTimer&) = delete;
-    ScopeTimer& operator=(const ScopeTimer&) = delete;
+    explicit StatTimer(StatSite& site) noexcept : site_(site), start_(ticks()) {}
+    ~StatTimer() { addStat(site_, static_cast<double>(ticks() - start_)); }
+    StatTimer(const StatTimer&) = delete;
+    StatTimer& operator=(const StatTimer&) = delete;
 
 private:
     StatSite& site_;
-    std::uint64_t start_;
+    uint64_t start_;
 };
 
-// ECO_LOG_EVERY_MS の判定：前に通してから interval 経っていれば通す。省いた回数を数える。
-struct RateLimiter {
-    std::atomic<std::uint64_t> next{0};
-    std::atomic<std::uint64_t> suppressed{0};
+// ---- まとめ書き ------------------------------------------------------------------------------------------
 
-    bool allow(std::uint64_t intervalMs, std::uint64_t& suppressedOut) noexcept {
-        const std::uint64_t now = ticks();
-        std::uint64_t expected = next.load(std::memory_order_relaxed);
-        if (now < expected) {
-            suppressed.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        const auto interval = static_cast<std::uint64_t>(static_cast<double>(intervalMs) * ticksPerMillisecond());
-        if (!next.compare_exchange_strong(expected, now + interval, std::memory_order_relaxed)) {
-            suppressed.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        suppressedOut = suppressed.exchange(0, std::memory_order_relaxed);
-        return true;
+// 塊を1件として書く：頭［＋始めの時刻］＋BatchInfo＋値の並び。
+inline void writeBatch(const Site& site, SiteIdSlot& slot, uint64_t startTick, uint32_t count, uint32_t elementSize,
+                       const unsigned char* elements) noexcept {
+    ThreadBuffer* buffer = threadBuffer();
+    const uint32_t id = siteId(site, slot);
+    const bool withTime = startTick != 0;
+    const size_t bytes = static_cast<size_t>(count) * elementSize;
+    const size_t size = alignRecord(sizeof(RecordHeader) + (withTime ? 8 : 0) + sizeof(BatchInfo) + bytes);
+    unsigned char* out = size <= kMaxRecordBytes && id != 0 ? buffer->reserve(size, site.level >= Level::Warn) : nullptr;
+    if (!out) [[unlikely]] {
+        buffer->countDrop();
+        return;
     }
-};
+    const RecordHeader header{static_cast<uint16_t>(size), RecordKind::Batch,
+                              static_cast<uint8_t>(withTime ? kRecordHasTick : 0), id};
+    memcpy(out, &header, sizeof(header));
+    unsigned char* cursor = out + sizeof(RecordHeader);
+    if (withTime) {
+        memcpy(cursor, &startTick, 8);
+        cursor += 8;
+    }
+    const BatchInfo info{count, elementSize, withTime ? ticks() : 0};
+    memcpy(cursor, &info, sizeof(info));
+    cursor += sizeof(info);
+    memcpy(cursor, elements, bytes);
+    buffer->commit();
+}
 
 }  // namespace detail
 
-}  // namespace eco::log
+// まとめ書き（ECO_LOG_BATCH が作る）。同じ書式のログが続くループ用に、1件ごとには頭も時刻も付けず、値だけを
+// 手元（スタック）に元の大きさで並べる。一杯になったとき・flush()・スコープの終わりに、まとめて1件として書く。
+template <class... Types>
+class Batch {
+    static_assert(sizeof...(Types) > 0, "ECOCppLogger: ECO_LOG_BATCH には値の型を1つ以上書いてください");
+
+public:
+    static constexpr size_t kElementSize = detail::BatchTags<Types...>::elementSize;
+    static constexpr size_t kScratchBytes = 8192;
+    static constexpr uint32_t kCapacity = static_cast<uint32_t>(kScratchBytes / kElementSize > 0 ? kScratchBytes / kElementSize : 1);
+
+    Batch(const Site& site, SiteIdSlot& id, bool compiled) noexcept
+        : site_(site), id_(id), enabled_(compiled && detail::isEnabled(site.level)) {}
+    ~Batch() { flush(); }
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+
+    // 1件足す（一杯かの確認＋値のコピーだけ）。
+    void add(const Types&... values) noexcept {
+        if (!enabled_) {
+            return;
+        }
+        if (count_ == kCapacity) [[unlikely]] {
+            flush();
+        }
+        if (count_ == 0) {
+            startTick_ = detail::recordTime() ? ticks() : 0;
+        }
+        unsigned char* cursor = scratch_ + static_cast<size_t>(count_) * kElementSize;
+        ((cursor = put(cursor, detail::batchValue(values))), ...);
+        ++count_;
+    }
+
+    // 溜めた分を今すぐ書く。
+    void flush() noexcept {
+        if (count_ == 0) {
+            return;
+        }
+        detail::writeBatch(site_, id_, startTick_, count_, static_cast<uint32_t>(kElementSize), scratch_);
+        count_ = 0;
+    }
+
+    bool enabled() const noexcept { return enabled_; }
+    uint32_t size() const noexcept { return count_; }
+
+private:
+    template <class V>
+    static unsigned char* put(unsigned char* out, const V& value) noexcept {
+        memcpy(out, &value, sizeof(V));
+        return out + sizeof(V);
+    }
+
+    const Site& site_;
+    SiteIdSlot& id_;
+    bool enabled_;
+    uint32_t count_ = 0;
+    uint64_t startTick_ = 0;
+    alignas(8) unsigned char scratch_[kCapacity * kElementSize];
+};
+
+// ECO_LOG_ENABLE=0 のときの ECO_LOG_BATCH（何もしない）。
+struct NullBatch {
+    template <class... Args>
+    void add(const Args&...) const noexcept {}
+    void flush() const noexcept {}
+    bool enabled() const noexcept { return false; }
+    uint32_t size() const noexcept { return 0; }
+};
+
+}  // namespace lg

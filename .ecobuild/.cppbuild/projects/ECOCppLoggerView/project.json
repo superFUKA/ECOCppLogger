@@ -1,7 +1,7 @@
 {
   "data": {
     "dependencies": {
-      "fcfcc4ae59cc4b28b29fd4a9699bc009": {
+      "a992dcdc5c7d48b79a282b340338099d": {
         "kind": "project",
         "values": {
           "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
@@ -9,7 +9,7 @@
         }
       }
     },
-    "guid": "5dec2d52-c892-4412-b1b6-07b66d890e99",
+    "guid": "e1b70685-d7ba-4bd0-af28-56ce489da2ef",
     "initial_type": "executable",
     "name": "ECOCppLoggerView",
     "project_headers": [],

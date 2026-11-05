@@ -57,6 +57,13 @@ uint64_t frame() noexcept;
 // 値は呼んだときに写し取る（その後に上書きされても残る）。落ちたときは自動で書き出す。
 void dumpHistory(const char* reason);
 
+// 情報を足す（例：lg::setInfo("level", "forest_02")）。今のファイルと、この後に開くファイルの頭に書く（"event":"info"）。
+// 同じ key をもう一度渡すと置き換える。start() の前に呼んでもよい。
+void setInfo(const char* key, const char* value);
+
+// この実行の ID（UUID の形。start() ごとに新しくなる。ファイルの session.start の run と同じ）。
+const char* runId() noexcept;
+
 // 呼んだスレッドのスタック（関数名・ソースの位置）を書き出す（"event":"stack" の行。次の writeOut() で書く）。
 void writeStack(const char* reason);
 

@@ -48,6 +48,10 @@ public:
     // 呼んだスレッドで書いて閉じる。書き出しの途中で落ちたときは、少し待ってからロックなしで書く。
     void emergency(std::string_view reason, const std::string& extraJson) noexcept;
 
+    // 情報を足す（lg::setInfo）。今のファイルと、この後に開くファイルの頭に書く。同じ key は置き換える。
+    void setInfo(std::string_view key, std::string_view value);
+    const char* runId() const noexcept { return runId_.c_str(); }
+
     // minidump を置く場所（start() の後。ログのファイルと同じ名前で .dmp）。
     std::wstring crashDumpPath() const;
 
@@ -90,6 +94,7 @@ private:
     void writeEventTo(Output& output, uint64_t tick, std::string_view body);
     void writeSessionStart(Output& output);
     void writeSessionEnd(bool crashed);
+    static std::string infoBody(std::string_view key, std::string_view value);
     void drain(bool emergency);
     void writeConsole(const RecordHeader& header, std::string_view thread);
 
@@ -111,6 +116,9 @@ private:
     double ticksToMicroseconds(double ticks) const;
 
     std::timed_mutex io_;
+    std::string runId_;
+    std::string environment_;
+    std::vector<std::pair<std::string, std::string>> infos_;
     std::atomic<bool> crashed_{false};
     std::filesystem::path crashDumpPath_;
     bool running_ = false;

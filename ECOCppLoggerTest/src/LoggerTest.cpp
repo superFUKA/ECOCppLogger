@@ -80,7 +80,7 @@ TEST(Logger, WritesLogsOfOtherThreads) {
     for (auto& thread : threads) thread.join();
     const auto lines = session.lines();
     EXPECT_EQ(countContaining(lines, "\"msg\":\"w"), 4000u);
-    EXPECT_EQ(countContaining(lines, "\"th\":\"worker3\""), 1000u);
+    EXPECT_EQ(countContaining(lines, "\"th\":\"worker3\",\"src\""), 1000u);
     EXPECT_EQ(countContaining(lines, "\"event\":\"dropped\""), 0u);
 }
 

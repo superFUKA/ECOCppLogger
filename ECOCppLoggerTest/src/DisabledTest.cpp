@@ -44,5 +44,5 @@ TEST(Disabled, MacrosLeaveNoCode) {
     EXPECT_EQ(g_evaluated, 1);  // ECO_VERIFY の式だけ評価する
     g_evaluated = 0;
     EXPECT_EQ(g_evaluated, 0);  // 引数も評価しない
-    EXPECT_EQ(lgtest::countContaining(session.lines(), "disabled"), 0u);
+    EXPECT_EQ(lgtest::countContaining(session.lines(), "\"msg\":\"disabled"), 0u);
 }

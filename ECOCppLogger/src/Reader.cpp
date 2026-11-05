@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "FileFormat.h"
@@ -26,8 +27,13 @@ constexpr std::string_view kAbout =
     "fiber=fiber the thread was running, scope_event=enter/exit of a scope (us=time spent inside). sample=this site is sampled (n=call count, skipped=calls not "
     "logged since the previous line, on change=written only when the value changed, change=0 is the first value). "
     "batch=a loop logged in one block (rows=values of each iteration, us=time the block took, omitted=rows not shown). "
+    "event=session.start has run (id of this run), event=environment has the app, build, OS, CPU, memory and GPU, "
+    "event=info is a value given by lg::setInfo, event=thread maps a thread name to its OS thread id (tid). "
     "event=dropped means the thread's buffer was full and that many records were lost. event=crash has the reason, "
-    "exception and stack.";
+    "exceptions (outermost first), stack of the crashed thread, registers, threads (stacks of the other threads), "
+    "modules and minidump. event=stack is a stack written by a failed assert or lg::writeStack. lv=stat is a value "
+    "aggregated over ms milliseconds (n=count, avg/min/max/last/sum, per_s for counts, unit=us for times). "
+    "lv=history lists recent values of a stat (ago_ms=milliseconds before the dump, f=frame, v=value).";
 
 struct OwnedSite {
     Site site{};
@@ -137,6 +143,8 @@ struct LogReader::State {
     std::unordered_map<uint32_t, uint64_t> threadFiber;               // スレッドで今走っているファイバー
     std::unordered_map<uint64_t, std::vector<OpenScope>> openScopes;  // ファイバー（なければスレッド）ごと
     std::string message;
+    std::vector<std::string> pendingThreadLines;
+    std::unordered_set<std::string> knownThreadLines;
     std::string out;
 
     State(ViewFormat format_, const ViewFilter& filter)
@@ -239,12 +247,21 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
     case file::FrameType::ThreadDef: {
         if (size < sizeof(file::ThreadDefPayload)) return;
         const auto payload = readAt<file::ThreadDefPayload>(cursor);
-        threads[payload.index] = std::string(cursor, end);
+        std::string name(cursor, end);
+        std::string body = "\"lv\":\"info\",\"event\":\"thread\",\"th\":";
+        detail::appendJsonString(body, name);
+        body.append(",\"tid\":");
+        detail::appendUnsigned(body, payload.osThreadId);
+        if (knownThreadLines.insert(body).second) {
+            pendingThreadLines.push_back(std::move(body));  // 次の Block の始めの位置に出す
+        }
+        threads[payload.index] = std::move(name);
         return;
     }
     case file::FrameType::Block: {
         if (size < sizeof(file::BlockPayload)) return;
         const auto block = readAt<file::BlockPayload>(cursor);
+        bool firstRecord = true;
         while (end - cursor >= static_cast<std::ptrdiff_t>(sizeof(RecordHeader))) {
             RecordHeader header;
             std::memcpy(&header, cursor, sizeof(header));
@@ -256,6 +273,15 @@ void LogReader::State::frame(file::FrameType type, const char* data, size_t size
                 std::memcpy(record.data(), cursor, header.size);
                 const RecordView view = viewRecord(*reinterpret_cast<const RecordHeader*>(record.data()));
                 const uint64_t order = view.tick != 0 ? view.tick : block.drainTick;
+                if (firstRecord) {
+                    firstRecord = false;
+                    for (std::string& body : pendingThreadLines) {
+                        if (typeSelected("event", false)) {
+                            entries.push_back(Entry{order, 0, EntryKind::Event, 0, nullptr, {}, std::move(body)});
+                        }
+                    }
+                    pendingThreadLines.clear();
+                }
                 if (header.kind == RecordKind::Frame) {
                     Entry entry{order, view.tick, EntryKind::Frame, block.thread, nullptr, {}, {}};
                     std::memcpy(&entry.frame, view.payload, 8);

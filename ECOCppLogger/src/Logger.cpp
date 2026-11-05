@@ -118,6 +118,14 @@ void dumpHistory(const char* reason) {
     detail::writer().dumpHistory(reason ? reason : "");
 }
 
+void setInfo(const char* key, const char* value) {
+    detail::writer().setInfo(key ? key : "", value ? value : "");
+}
+
+const char* runId() noexcept {
+    return detail::writer().runId();
+}
+
 void writeStack(const char* reason) {
     uint64_t addresses[64];
     const size_t count = detail::captureStack(addresses, 64, 1);  // writeStack 自身は飛ばす

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "ECOCppLogger/Logger.h"
+#include "Environment.h"
 #include "Registry.h"
 
 #if defined(_WIN32)
@@ -271,7 +272,9 @@ void Writer::flushAll(bool close) {
 }
 
 void Writer::writeSessionStart(Output& output) {
-    event_ = "\"lv\":\"info\",\"event\":\"session.start\",\"pid\":";
+    event_ = "\"lv\":\"info\",\"event\":\"session.start\",\"run\":";
+    appendJsonString(event_, runId_);
+    event_.append(",\"pid\":");
     appendSigned(event_, processId());
     event_.append(",\"exe\":");
     appendJsonString(event_, toUtf8(executablePath()));
@@ -287,7 +290,34 @@ void Writer::writeSessionStart(Output& output) {
     event_.append(config_.recordTime ? "true" : "false");
     event_.append(",\"thread_buffer_bytes\":");
     appendUnsigned(event_, config_.threadBufferBytes);
-    writeEventTo(output, ticks(), event_);
+    const uint64_t tick = ticks();
+    writeEventTo(output, tick, event_);
+    // ファイルごとに読めるように、環境の情報・足した情報も毎回書く。
+    writeEventTo(output, tick, environment_);
+    for (const auto& [key, value] : infos_) {
+        writeEventTo(output, tick, infoBody(key, value));
+    }
+}
+
+std::string Writer::infoBody(std::string_view key, std::string_view value) {
+    std::string body = "\"lv\":\"info\",\"event\":\"info\",\"key\":";
+    appendJsonString(body, key);
+    body.append(",\"value\":");
+    appendJsonString(body, value);
+    return body;
+}
+
+void Writer::setInfo(std::string_view key, std::string_view value) {
+    std::lock_guard lock(io_);
+    auto found = std::find_if(infos_.begin(), infos_.end(), [&](const auto& info) { return info.first == key; });
+    if (found != infos_.end()) {
+        found->second = value;
+    } else {
+        infos_.emplace_back(key, value);
+    }
+    if (running_) {
+        writeEvent(EventKind::Event, ticks(), infoBody(key, value));
+    }
 }
 
 void Writer::writeSessionEnd(bool crashed) {
@@ -328,6 +358,8 @@ bool Writer::start(const Config& config) {
                 started.substr(11, 2) + started.substr(14, 2) + started.substr(17, 2) + "_" +
                 std::to_string(processId());
     crashDumpPath_ = fromUtf8(directory_) / fromUtf8(baseName_ + ".dmp");
+    runId_ = newRunId();
+    environment_ = collectEnvironment(config.app);
     crashed_.store(false);
     records_ = 0;
     dropped_ = 0;

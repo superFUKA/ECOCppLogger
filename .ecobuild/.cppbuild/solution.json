@@ -14,21 +14,21 @@
       "test": "test.cpp",
       "unit_test": "unit_test.cpp"
     },
-    "main_project": "ECOCppLogger",
+    "main_subproject": "ECOCppLogger",
     "name": "ECOCppLogger",
-    "projects": {
+    "references": {},
+    "solution_folders": {
+      "linked_subprojects": "LinkedSubprojects",
+      "subproject_folders": {},
+      "subprojects": "Subprojects"
+    },
+    "subprojects": {
       "ECOCppLogger": "../../ECOCppLogger",
       "ECOCppLoggerBench": "../../ECOCppLoggerBench",
       "ECOCppLoggerTest": "../../ECOCppLoggerTest",
       "ECOCppLoggerView": "../../ECOCppLoggerView"
-    },
-    "references": {},
-    "solution_folders": {
-      "linked_projects": "LinkedProjects",
-      "project_folders": {},
-      "projects": "Projects"
     }
   },
   "kind": "solution",
-  "schema_version": 5
+  "schema_version": 6
 }

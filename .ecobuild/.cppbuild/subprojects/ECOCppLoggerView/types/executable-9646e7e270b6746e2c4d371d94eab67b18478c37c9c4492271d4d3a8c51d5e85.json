@@ -6,6 +6,6 @@
     ],
     "public_definitions": []
   },
-  "kind": "static_library",
-  "schema_version": 5
+  "kind": "executable",
+  "schema_version": 6
 }

@@ -6,6 +6,6 @@
     ],
     "public_definitions": []
   },
-  "kind": "executable",
-  "schema_version": 5
+  "kind": "test",
+  "schema_version": 6
 }

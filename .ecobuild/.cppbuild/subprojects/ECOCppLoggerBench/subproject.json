@@ -2,26 +2,26 @@
   "data": {
     "dependencies": {
       "6a6f13c2b49d4788b7c62b60aacbce03": {
-        "kind": "project",
+        "kind": "subproject",
         "values": {
-          "project_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
-          "project_type": "static_library"
+          "subproject_guid": "ec41152a-a7e6-4c4d-b618-61a7fbd9b2cd",
+          "subproject_type": "static_library"
         }
       }
     },
     "guid": "2a15a8e9-88c9-437e-87b7-5a85f4e52085",
     "initial_type": "executable",
     "name": "ECOCppLoggerBench",
-    "project_headers": [],
     "source_directories": [
       "src",
       "include"
     ],
+    "subproject_headers": [],
     "system_headers": [],
     "types": {
-      "executable": "executable-8848ded3be73bc6bd820244b1cec0b6b459348f6dbd4e312ad6f2805afd0666b.json"
+      "executable": "executable-9646e7e270b6746e2c4d371d94eab67b18478c37c9c4492271d4d3a8c51d5e85.json"
     }
   },
-  "kind": "project",
-  "schema_version": 5
+  "kind": "subproject",
+  "schema_version": 6
 }

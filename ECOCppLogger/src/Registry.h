@@ -33,8 +33,8 @@ public:
     std::string name(const ThreadBuffer* buffer);
     void removeRetired(const std::vector<ThreadBuffer*>& done);
 
-    // これから作るバッファの大きさ・取っておく割合（start() の Config から）。
-    void setBufferSettings(size_t bytes, uint32_t reservePercent);
+    // これから作るバッファの大きさ・広げる上限・取っておく割合（start() の Config から）。
+    void setBufferSettings(size_t bytes, size_t maxBytes, uint32_t reservePercent);
 
     uint32_t registerSite(const Site& site, SiteIdSlot& slot) noexcept;
     const Site* site(uint32_t id) const noexcept;
@@ -50,7 +50,8 @@ private:
     std::vector<std::unique_ptr<ThreadBuffer>> buffers_;
     std::vector<std::string> names_;  // buffers_ と同じ順
     uint32_t nextThreadIndex_ = 0;
-    size_t bufferBytes_ = size_t{1} << 20;
+    size_t bufferBytes_ = size_t{4} << 20;      // Config の既定と同じ（start() の前に作るバッファ用）
+    size_t maxBufferBytes_ = size_t{64} << 20;
     uint32_t reservePercent_ = 10;
 
     std::mutex siteMutex_;

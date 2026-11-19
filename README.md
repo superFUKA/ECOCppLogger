@@ -22,10 +22,15 @@ int main() {
         ECO_FRAME();                        // フレームの区切り
         ECO_LOG_INFO("player {id} hp={hp}", id, hp);           // JSON では "args":{"id":…,"hp":…}
         ECO_LOG(Warn | Physics, "貫通 depth={d:.3}", depth);  // 書式指定：.3・x・08
-        lg::writeOut();                     // ループの終わりに、このスレッドでファイルへ
+        lg::writeOut();                     // ループの終わりに、このスレッドでファイルへ（毎フレーム呼ぶ）
     }
 }                                           // 終わり・落ちたときは自動で書き出す
 ```
+
+> **`lg::writeOut()` は毎フレーム（定期的に）呼んでください。** 呼ぶまで、記録はスレッドごとのバッファにたまります。
+> バッファは 4MB から始まり、あふれたら倍の大きさへ広げます（スレッドごとに上限 64MB。`Config.threadBufferBytes`・
+> `maxThreadBufferBytes`）。広げたときは `"event":"buffer_grown"` を書くので、これが出たら呼ぶ間隔が長すぎるか、ログが多すぎます。
+> 上限まで広げても入らない分は捨て、捨てた件数を `"event":"dropped"` に書きます。
 
 | 書き方 | 用途 |
 |---|---|

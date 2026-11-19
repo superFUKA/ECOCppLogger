@@ -290,6 +290,8 @@ void Writer::writeSessionStart(Output& output) {
     event_.append(config_.recordTime ? "true" : "false");
     event_.append(",\"thread_buffer_bytes\":");
     appendUnsigned(event_, config_.threadBufferBytes);
+    event_.append(",\"max_thread_buffer_bytes\":");
+    appendUnsigned(event_, config_.maxThreadBufferBytes);
     const uint64_t tick = ticks();
     writeEventTo(output, tick, event_);
     // ファイルごとに読めるように、環境の情報・足した情報も毎回書く。
@@ -538,6 +540,18 @@ void Writer::drain(bool emergency) {
                 }
             }
         });
+        const size_t capacity = buffer->capacity();
+        if (capacity > buffer->reportedCapacity) {
+            // writeOut() の間に初めの大きさを超えるほどたまった（呼ぶ間隔が長い・ログが多い）。
+            event_ = "\"lv\":\"info\",\"event\":\"buffer_grown\",\"th\":";
+            appendJsonString(event_, entry.name);
+            event_.append(",\"bytes\":");
+            appendUnsigned(event_, capacity);
+            event_.append(",\"max\":");
+            appendUnsigned(event_, buffer->maxCapacity());
+            writeEvent(EventKind::Event, ticks(), event_);
+            buffer->reportedCapacity = capacity;
+        }
         const uint64_t dropped = buffer->dropped();
         if (dropped > buffer->reportedDropped) {
             event_ = "\"lv\":\"warn\",\"event\":\"dropped\",\"th\":";

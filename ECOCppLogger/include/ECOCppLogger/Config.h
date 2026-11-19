@@ -60,8 +60,12 @@ struct Config {
     uint32_t statIntervalMs = 1000;  // 集計を出す間隔（writeOut() のときに、この間隔が来ていれば出す）
 
     // ---- スレッドごとのバッファ ----
-    uint64_t threadBufferBytes = uint64_t{1} << 20;  // 2 のべき乗に切り上げ。writeOut() の間にたまる量より大きく
-    uint32_t importantReservePercent = 10;           // 空きがこの割合を切ったら、Warn 未満のログは捨てる（数える）
+    // writeOut() の間にたまる量が初めの大きさを超えたら、倍の大きさのバッファを取って広げる（上限まで。読み切った古い
+    // バッファは writeOut() で解放する。広げたことは "event":"buffer_grown" の行で分かる）。上限でも入らなければ捨てて
+    // 数える（"event":"dropped"）。広げたくなければ maxThreadBufferBytes を threadBufferBytes 以下にする。
+    uint64_t threadBufferBytes = uint64_t{4} << 20;      // 初めの大きさ（2 のべき乗に切り上げ）
+    uint64_t maxThreadBufferBytes = uint64_t{64} << 20;  // 広げる上限（スレッドごと。これを超えない 2 のべき乗まで）
+    uint32_t importantReservePercent = 10;  // 空きがこの割合を切ったら、Warn 未満のログは（広げられなければ）捨てる（数える）
 
     // ---- 標準エラーへの表示（人がその場で見る用。文字列を作るので重い） ----
     Level consoleLevel = Level::Off;

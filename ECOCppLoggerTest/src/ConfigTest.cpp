@@ -13,6 +13,12 @@ TEST(Config, DefaultsWriteEverythingToLogs) {
     EXPECT_EQ(config.assertAction, lg::AssertAction::Break);
 }
 
+TEST(Config, ThreadBufferStartsAt4MBAndGrowsTo64MB) {
+    const lg::Config config;
+    EXPECT_EQ(config.threadBufferBytes, uint64_t{4} << 20);
+    EXPECT_EQ(config.maxThreadBufferBytes, uint64_t{64} << 20);
+}
+
 TEST(Config, DestinationsUsePlainTypes) {
     const lg::Destination destinations[] = {
         {.name = "human", .level = lg::Level::Info, .excludeTypes = "batch,stat"},

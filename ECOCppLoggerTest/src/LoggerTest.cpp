@@ -95,6 +95,7 @@ TEST(Logger, KeepsRecordsWrittenBeforeStart) {
 TEST(Logger, DropsLightLogsFirstWhenBufferIsNearlyFull) {
     TestConfig test;
     test.config.threadBufferBytes = 4096;
+    test.config.maxThreadBufferBytes = 4096;  // 広げない
     test.config.importantReservePercent = 50;
     Session session(test.config);
     std::thread([] {  // 新しいスレッド：4096 バイトのバッファ
@@ -108,6 +109,39 @@ TEST(Logger, DropsLightLogsFirstWhenBufferIsNearlyFull) {
     const std::string* dropped = findContaining(lines, "\"event\":\"dropped\"");
     ASSERT_NE(dropped, nullptr);
     EXPECT_GT(countContaining(lines, "\"msg\":\"noise "), 0u);
+}
+
+TEST(Logger, GrowsBufferInsteadOfDroppingWithoutWriteOut) {
+    TestConfig test;
+    test.config.threadBufferBytes = 4096;
+    test.config.maxThreadBufferBytes = 1 << 20;
+    Session session(test.config);
+    std::thread([] {  // 新しいスレッド：4096 バイトから。writeOut() を呼ばずに 4096 バイトを大きく超えて書く
+        for (int i = 0; i < 1000; ++i) {
+            ECO_LOG_DEBUG("noise {i}", i);
+        }
+    }).join();
+    const auto lines = session.lines();
+    EXPECT_EQ(countContaining(lines, "\"msg\":\"noise "), 1000u);
+    EXPECT_EQ(findContaining(lines, "\"event\":\"dropped\""), nullptr);
+    EXPECT_NE(findContaining(lines, "\"event\":\"buffer_grown\""), nullptr);
+}
+
+TEST(Logger, DropsWhenBufferIsFullAtMaxSize) {
+    TestConfig test;
+    test.config.threadBufferBytes = 4096;
+    test.config.maxThreadBufferBytes = 16384;
+    Session session(test.config);
+    std::thread([] {
+        for (int i = 0; i < 2000; ++i) {
+            ECO_LOG_ERROR("noise {i}", i);
+        }
+    }).join();
+    const auto lines = session.lines();
+    const size_t kept = countContaining(lines, "\"msg\":\"noise ");
+    EXPECT_GT(kept, 0u);
+    EXPECT_LT(kept, 2000u);
+    EXPECT_NE(findContaining(lines, "\"event\":\"dropped\""), nullptr);
 }
 
 TEST(Logger, RecordsFrameNumbers) {

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstring>
 #include <thread>
 
@@ -111,6 +112,95 @@ TEST(ThreadBuffer, ProducerAndConsumerOnDifferentThreads) {
             ASSERT_EQ(value, expected);
             ++expected;
         });
+    }
+    producer.join();
+    EXPECT_TRUE(buffer.empty());
+}
+
+TEST(ThreadBuffer, GrowsWhenFullAndKeepsOrder) {
+    ThreadBuffer buffer(4096, 0, 0, 0, 1 << 16);
+    uint64_t written = 0;
+    while (writeRecord(buffer, written, 64)) {
+        ++written;
+    }
+    // 4096 → 8192 → … → 65536：古いリングの中身も残るので、全部の和だけ書ける。
+    EXPECT_EQ(written, (4096u + 8192u + 16384u + 32768u + 65536u) / 64);
+    EXPECT_EQ(buffer.capacity(), 65536u);
+    uint64_t expected = 0;
+    consumeValues(buffer, [&](uint64_t value) {
+        EXPECT_EQ(value, expected);
+        ++expected;
+    });
+    EXPECT_EQ(expected, written);
+    EXPECT_TRUE(buffer.empty());
+    // 読み切った後は、一番大きいリングだけが残って使える。
+    uint64_t again = 0;
+    while (writeRecord(buffer, again, 64)) {
+        ++again;
+    }
+    EXPECT_EQ(again, 65536u / 64);
+}
+
+TEST(ThreadBuffer, GrowsAcrossWrapKeepingOrder) {
+    ThreadBuffer buffer(4096, 0, 0, 0, 1 << 20);
+    uint64_t next = 0;
+    uint64_t expected = 0;
+    for (int round = 0; round < 300; ++round) {
+        const size_t size = 16 + static_cast<size_t>((round * 24) % 400);
+        // 1回ごとに書く量を増やし、途中の位置（折り返しの後など）で広げる。
+        for (int i = 0; i < 10 + round * 3; ++i) {
+            ASSERT_TRUE(writeRecord(buffer, next, size));
+            ++next;
+        }
+        consumeValues(buffer, [&](uint64_t value) {
+            ASSERT_EQ(value, expected);
+            ++expected;
+        });
+    }
+    EXPECT_EQ(expected, next);
+    EXPECT_GT(buffer.capacity(), 4096u);
+}
+
+TEST(ThreadBuffer, GrowsForLightRecordsKeepingReserve) {
+    ThreadBuffer buffer(4096, 25, 0, 0, 8192);
+    int normal = 0;
+    while (writeRecord(buffer, 0, 64, false)) {
+        ++normal;
+    }
+    EXPECT_EQ(normal, (3072 + 6144) / 64);  // どちらのリングも、軽い記録は 3/4 まで
+    int important = 0;
+    while (writeRecord(buffer, 0, 64, true)) {
+        ++important;
+    }
+    EXPECT_EQ(important, 2048 / 64);  // 上限のリングの残りは大事な記録が使える
+}
+
+TEST(ThreadBuffer, GrowsForLargeRecords) {
+    ThreadBuffer buffer(4096, 0, 0, 0, 1 << 16);
+    EXPECT_NE(buffer.reserve(2048 + 8, true), nullptr);
+    buffer.commit();
+    EXPECT_GE(buffer.capacity(), 8192u);
+}
+
+TEST(ThreadBuffer, GrowsWhileConsumerRunsOnAnotherThread) {
+    ThreadBuffer buffer(4096, 0, 0, 0, 1 << 22);
+    constexpr uint64_t kCount = 300000;
+    std::atomic<bool> done{false};
+    std::thread producer([&] {
+        for (uint64_t i = 0; i < kCount;) {
+            if (writeRecord(buffer, i, 16 + (i % 7) * 8)) {
+                ++i;
+            }
+        }
+        done = true;
+    });
+    uint64_t expected = 0;
+    while (expected < kCount) {
+        consumeValues(buffer, [&](uint64_t value) {
+            ASSERT_EQ(value, expected);
+            ++expected;
+        });
+        if (expected < kCount) std::this_thread::yield();
     }
     producer.join();
     EXPECT_TRUE(buffer.empty());

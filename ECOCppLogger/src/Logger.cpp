@@ -43,6 +43,7 @@ void stopAtExit() {
 
 bool start(const Config& config) {
     detail::Registry::instance().setBufferSettings(static_cast<size_t>(config.threadBufferBytes),
+                                                   static_cast<size_t>(config.maxThreadBufferBytes),
                                                    config.importantReservePercent);
     detail::g_level.store(static_cast<uint8_t>(config.level), std::memory_order_relaxed);
     detail::g_recordTime.store(config.recordTime, std::memory_order_relaxed);
